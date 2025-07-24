@@ -434,8 +434,9 @@ class TocabiAMPLowerBase(VecTask):
         self.terrain_types = torch.randint(0, self.cfg["env"]["terrain"]["numTerrains"], (self.num_envs,), device=self.device)
         if self.custom_origins:
             self.terrain_origins = torch.from_numpy(self.terrain.env_origins).to(self.device).to(torch.float)
-            spacing = 0.
-        
+            # spacing = 0.
+            spacing = min(self.cfg["env"]["terrain"]["mapLength"], self.cfg["env"]["terrain"]["mapWidth"]) # 환경 간 최소 간격 확보
+
         # 로봇 사이 간격 조정
         lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         upper = gymapi.Vec3(spacing, spacing, spacing)

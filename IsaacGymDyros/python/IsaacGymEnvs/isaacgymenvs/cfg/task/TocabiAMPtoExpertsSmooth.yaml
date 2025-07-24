@@ -1,11 +1,11 @@
 # used to create the object
-name: TocabiAMPtoExpertsStairsUp
+name: TocabiAMPtoExpertsSmooth
 
 physics_engine: ${..physics_engine}
 
 # if given, will override the device setting in gym.
 env: 
-  numEnvs: ${resolve_default:4096,${...num_envs}}
+  numEnvs: ${resolve_default:512,${...num_envs}}
   envSpacing: 5
   episodeLength: 8000
   cameraFollow: False # if the camera follows humanoid or not
@@ -57,7 +57,7 @@ env:
       numTerrains: 20
       # terrain types: [smooth slope, rough slope, stairs up, stairs down, discrete]
       #terrainProportions: [0.3, 0.3, 0.2, 0.2, 0.0]
-      terrainProportions: [0.0, 0.0, 1.0, 0.0, 0.0]
+      terrainProportions: [1.0, 0.0, 0.0, 0.0, 0.0]
       # tri mesh only:
       slopeTreshold: 0.5
 

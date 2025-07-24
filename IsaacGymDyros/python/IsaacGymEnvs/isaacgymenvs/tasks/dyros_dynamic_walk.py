@@ -18,6 +18,9 @@ from .base.vec_task import VecTask
 from isaacgymenvs.cfg.terrain.terrain_cfg import TerrainCfg
 from isaacgymenvs.utils.terrain import Terrain
 
+# Import the reward function
+from .dyros_reward_v2 import compute_humanoid_walk_reward_v2
+
 
 class DyrosDynamicWalk(VecTask):
 
@@ -73,7 +76,7 @@ class DyrosDynamicWalk(VecTask):
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
-        # body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
+        body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
         # sensor_tensor = self.gym.acquire_force_sensor_tensor(self.sim)
         # sensors_per_env = 2
 
@@ -82,10 +85,10 @@ class DyrosDynamicWalk(VecTask):
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
-        # self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
 
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
-        # self.body_states = gymtorch.wrap_tensor(body_state).view(self.num_envs, -1, 13)
+        self.body_states = gymtorch.wrap_tensor(body_state).view(self.num_envs, -1, 13)
         
         # create some wrapper tensors for different slices
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
@@ -384,8 +387,15 @@ class DyrosDynamicWalk(VecTask):
         self.dof_limits_lower = to_torch(self.dof_limits_lower, device=self.device)
         self.dof_limits_upper = to_torch(self.dof_limits_upper, device=self.device)
 
+    # --- 발 pos/vel 추출 ---
+    l_pos = self.body_states[:, self.left_foot_idx, 0:3]
+    r_pos = self.body_states[:, self.right_foot_idx, 0:3]
+    l_vel = self.body_states[:, self.left_foot_idx, 7:10]
+    r_vel = self.body_states[:, self.right_foot_idx, 7:10]
     def compute_reward(self):
-        self.rew_buf[:], reward, name, self.contact_reward_sum[:] = compute_humanoid_walk_reward(
+        if self.cfg["env"].get("reward_version", "v1") == "v2":
+        self.rew_buf[:], reward, name, self.contact_reward_sum[:] = \
+        compute_humanoid_walk_reward_v2(
             self.reset_buf,
             self.progress_buf,
             self.target_vel,
@@ -411,6 +421,41 @@ class DyrosDynamicWalk(VecTask):
             self.contact_reward_sum,
             self.right_foot_idx,
             self.left_foot_idx
+            self.body_states,
+            l_pos, r_pos, l_vel, r_vel
+        )
+        else:
+        self.rew_buf[:], reward, name, self.contact_reward_sum[:] = \
+        compute_humanoid_walk_reward(
+            self.reset_buf,
+            self.progress_buf,
+            self.target_vel,
+            self.root_states,
+            self.target_data_qpos,
+            self.target_data_force,
+            self.dof_pos,
+            self.initial_dof_vel,
+            self.dof_vel,
+            self.pre_joint_velocity_states,
+            self.actions,
+            self.actions_pre,
+            # self.vec_sensor_tensor,
+            # self.pre_vec_sensor_tensor,
+            self.non_feet_idxs,
+            self.contact_forces,
+            self.contact_forces_pre,
+            self.mocap_data_idx,
+            self.termination_height,
+            self.death_cost,
+            self.policy_freq_scale,
+            self.total_mass,
+            self.contact_reward_sum,
+            self.right_foot_idx,
+            self.left_foot_idx,
+            self.body_states
+        )
+        self.rew_buf[:], reward, name, self.contact_reward_sum[:] = compute_humanoid_walk_reward(
+
         )
         reward = torch.cat([reward, self.perturb_start], 1)
 
@@ -426,6 +471,7 @@ class DyrosDynamicWalk(VecTask):
                 name.append('terrain '+str(i)+' level')
         self.extras["stacked_rewards"] = reward
         self.extras["reward_names"] = name
+
 
     def compute_observations(self):
         self.gym.refresh_dof_state_tensor(self.sim)
@@ -547,7 +593,7 @@ class DyrosDynamicWalk(VecTask):
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
-        # self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
 
         self.check_termination()
         self.compute_reward()

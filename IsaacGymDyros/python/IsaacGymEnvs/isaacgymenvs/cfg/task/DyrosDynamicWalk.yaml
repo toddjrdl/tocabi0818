@@ -34,6 +34,9 @@ env:
   # set to True if you use camera sensors in the environment
   enableCameraSensors: False
 
+  reward_version: "v2" # v1: old reward, v2: new reward
+
+
 sim:
   dt: 0.002 #0.0005 #0.004 # 0.0005 #1/2000 
   substeps: 1
