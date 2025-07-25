@@ -4,7 +4,7 @@ To Run this code, you must comment out
 part since, this part is worked in pre_physics_step in
 our code!!!!!!!!!!!!!!!!!!!!!!!!!!
 '''
-
+#0725
 import numpy as np
 import os
 import torch
@@ -54,7 +54,7 @@ class DyrosDynamicWalk(VecTask):
         super().__init__(config=self.cfg, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless)
 
         if self.viewer != None:
-            cam_pos = gymapi.Vec3(50.0, 25.0, 2.4)
+            cam_pos = gymapi.Vec3(0.0, 0.0, 2.4)
             cam_target = gymapi.Vec3(45.0, 25.0, 0.0)
             self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
         #for PD controll
@@ -387,74 +387,97 @@ class DyrosDynamicWalk(VecTask):
         self.dof_limits_lower = to_torch(self.dof_limits_lower, device=self.device)
         self.dof_limits_upper = to_torch(self.dof_limits_upper, device=self.device)
 
-    # --- 발 pos/vel 추출 ---
-    l_pos = self.body_states[:, self.left_foot_idx, 0:3]
-    r_pos = self.body_states[:, self.right_foot_idx, 0:3]
-    l_vel = self.body_states[:, self.left_foot_idx, 7:10]
-    r_vel = self.body_states[:, self.right_foot_idx, 7:10]
     def compute_reward(self):
+        # --- 발 pos/vel 추출 ---
+        l_pos = self.body_states[:, self.left_foot_idx, 0:3]
+        r_pos = self.body_states[:, self.right_foot_idx, 0:3]
+        l_vel = self.body_states[:, self.left_foot_idx, 7:10]
+        r_vel = self.body_states[:, self.right_foot_idx, 7:10]
+
+        # 보상 버전에 따른 분기
         if self.cfg["env"].get("reward_version", "v1") == "v2":
-        self.rew_buf[:], reward, name, self.contact_reward_sum[:] = \
-        compute_humanoid_walk_reward_v2(
-            self.reset_buf,
-            self.progress_buf,
-            self.target_vel,
-            self.root_states,
-            self.target_data_qpos,
-            self.target_data_force,
-            self.dof_pos,
-            self.initial_dof_vel,
-            self.dof_vel,
-            self.pre_joint_velocity_states,
-            self.actions,
-            self.actions_pre,
-            # self.vec_sensor_tensor,
-            # self.pre_vec_sensor_tensor,
-            self.non_feet_idxs,
-            self.contact_forces,
-            self.contact_forces_pre,
-            self.mocap_data_idx,
-            self.termination_height,
-            self.death_cost,
-            self.policy_freq_scale,
-            self.total_mass,
-            self.contact_reward_sum,
-            self.right_foot_idx,
-            self.left_foot_idx
-            self.body_states,
-            l_pos, r_pos, l_vel, r_vel
-        )
+            (self.rew_buf[:], reward, name,
+             self.contact_reward_sum[:]) = compute_humanoid_walk_reward_v2(
+                self.reset_buf,
+                self.progress_buf,
+                self.target_vel,
+                self.root_states,
+                self.target_data_qpos,
+                self.target_data_force,
+                self.dof_pos,
+                self.initial_dof_vel,
+                self.dof_vel,
+                self.pre_joint_velocity_states,
+                self.actions,
+                self.actions_pre,
+                # self.vec_sensor_tensor,
+                # self.pre_vec_sensor_tensor,
+                self.non_feet_idxs,
+                self.contact_forces,
+                self.contact_forces_pre,
+                self.mocap_data_idx,
+                self.termination_height,
+                self.death_cost,
+                self.policy_freq_scale,
+                self.total_mass,
+                self.contact_reward_sum,
+                self.right_foot_idx,
+                self.left_foot_idx,
+                # 최종 네 인자: 발 위치 및 속도
+                l_pos, r_pos, l_vel, r_vel
+            )
         else:
-        self.rew_buf[:], reward, name, self.contact_reward_sum[:] = \
-        compute_humanoid_walk_reward(
-            self.reset_buf,
-            self.progress_buf,
-            self.target_vel,
-            self.root_states,
-            self.target_data_qpos,
-            self.target_data_force,
-            self.dof_pos,
-            self.initial_dof_vel,
-            self.dof_vel,
-            self.pre_joint_velocity_states,
-            self.actions,
-            self.actions_pre,
-            # self.vec_sensor_tensor,
-            # self.pre_vec_sensor_tensor,
-            self.non_feet_idxs,
-            self.contact_forces,
-            self.contact_forces_pre,
-            self.mocap_data_idx,
-            self.termination_height,
-            self.death_cost,
-            self.policy_freq_scale,
-            self.total_mass,
-            self.contact_reward_sum,
-            self.right_foot_idx,
-            self.left_foot_idx,
-            self.body_states
-        )
-        self.rew_buf[:], reward, name, self.contact_reward_sum[:] = compute_humanoid_walk_reward(
+            (self.rew_buf[:], reward, name,
+             self.contact_reward_sum[:]) = compute_humanoid_walk_reward(
+                self.reset_buf,
+                self.progress_buf,
+                self.target_vel,
+                self.root_states,
+                self.target_data_qpos,
+                self.target_data_force,
+                self.dof_pos,
+                self.initial_dof_vel,
+                self.dof_vel,
+                self.pre_joint_velocity_states,
+                self.actions,
+                self.actions_pre,
+                self.non_feet_idxs,
+                self.contact_forces,
+                self.contact_forces_pre,
+                self.mocap_data_idx,
+                self.termination_height,
+                self.death_cost,
+                self.policy_freq_scale,
+                self.total_mass,
+                self.contact_reward_sum,
+                self.right_foot_idx,
+                self.left_foot_idx
+            )
+
+        (self.rew_buf[:], reward, name, self.contact_reward_sum[:]) = compute_humanoid_walk_reward(
+                self.reset_buf,
+                self.progress_buf,
+                self.target_vel,
+                self.root_states,
+                self.target_data_qpos,
+                self.target_data_force,
+                self.dof_pos,
+                self.initial_dof_vel,
+                self.dof_vel,
+                self.pre_joint_velocity_states,
+                self.actions,
+                self.actions_pre,
+                self.non_feet_idxs,
+                self.contact_forces,
+                self.contact_forces_pre,
+                self.mocap_data_idx,
+                self.termination_height,
+                self.death_cost,
+                self.policy_freq_scale,
+                self.total_mass,
+                self.contact_reward_sum,
+                self.right_foot_idx,
+                self.left_foot_idx
 
         )
         reward = torch.cat([reward, self.perturb_start], 1)
@@ -554,7 +577,8 @@ class DyrosDynamicWalk(VecTask):
             stop_torque = self.Kp*(self.initial_dof_pos[:,:] - self.dof_pos[:,:]) + self.Kv*(-self.dof_vel[:,:])
             
             #action_log -> tensor(num_envs, time(current~past 9), dofs(33))
-            self.action_log[:,0:-1,:] = self.action_log[:,1:,:] 
+            #I don't konw why this should be modified;
+            self.action_log[:,0:-1,:] = self.action_log[:,1:,:] .clone()
             self.action_log[:,-1,:] = self.action_torque
             self.simul_len_tensor[:,1] +=1
             self.simul_len_tensor[:,1] = self.simul_len_tensor[:,1].clamp(max=round(0.01/self.dt)+1, min=0)

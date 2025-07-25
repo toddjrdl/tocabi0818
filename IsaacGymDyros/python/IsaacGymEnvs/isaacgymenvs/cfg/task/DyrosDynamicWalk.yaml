@@ -20,7 +20,7 @@ env:
   NumSkip : 2
 
   initialHieght: 0.93
-
+  cameraFollow: True
 
   # cost parameters
   deathCost: 0.0

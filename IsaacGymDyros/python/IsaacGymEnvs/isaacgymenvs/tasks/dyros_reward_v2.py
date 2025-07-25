@@ -23,20 +23,16 @@ def _phi(err: torch.Tensor, w: float):
     return torch.exp(-w * torch.sum(err * err, dim=1))
 
 @torch.jit.script
-def _poly_height(t: Tensor):  # type: ignore
+def _poly_height(t: torch.Tensor):  # type: ignore
     """5‑th order polynomial height profile (unnormalised)."""
-    a0, a1, a2, a3, a4, a5 = 0.0, 0.1, 2.5, 4.7, 1.5, 0.6
+    a0, a1, a2, a3, a4, a5 = 0.0, 0.1, 2.5, -4.7, 1.5, 0.6
     return a0 + a1 * t + a2 * t * t + a3 * t ** 3 + a4 * t ** 4 + a5 * t ** 5
 
 @torch.jit.script
-def _poly_vel(t: Tensor):  # type: ignore
+def _poly_vel(t: torch.Tensor):  # type: ignore
     """Time derivative of _poly_height."""
-    a1, a2, a3, a4, a5 = 0.1, 2.5, 4.7, 1.5, 0.6
+    a1, a2, a3, a4, a5 = 0.1, 2.5, -4.7, 1.5, 0.6
     return a1 + 2.0 * a2 * t + 3.0 * a3 * t ** 2 + 4.0 * a4 * t ** 3 + 5.0 * a5 * t ** 4
-
-# precompute scale so that max height == 0.20 m
-poly_max = _poly_height(torch.tensor(1.0))  # value at t=1 s is > max, but peak occurs <1
-scale_h = 0.20 / poly_max
 
 # -------------------------------------------------------------------- #
 # main reward (TorchScript)
@@ -99,7 +95,7 @@ def compute_humanoid_walk_reward_v2(
     r_contact = (r_force > 30.0).float()
 
     # scaled & clipped
-    scale_F = 0.5 * total_mass * 9.81  # per env
+    scale_F = 0.5 * total_mass.squeeze(-1) * 9.81  # per env
     l_scaled = torch.clamp(l_force / scale_F, 0.0, 1.0)
     r_scaled = torch.clamp(r_force / scale_F, 0.0, 1.0)
 
@@ -115,19 +111,19 @@ def compute_humanoid_walk_reward_v2(
     # 3) Quintic foot-trajectory tracking
     # ------------------------------------------------------------ #
     # Estimate time parameter t [0,1] for swing leg: use vertical ratio heuristic
-    t_L = torch.clamp(l_pos[:, 2] / 0.20, 0.0, 1.0) * swing_L
-    t_R = torch.clamp(r_pos[:, 2] / 0.20, 0.0, 1.0) * swing_R
+    t_L = torch.clamp(l_foot_pos[:, 2] / 0.20, 0.0, 1.0) * swing_L
+    t_R = torch.clamp(r_foot_pos[:, 2] / 0.20, 0.0, 1.0) * swing_R
 
-    h_ref_L = _poly_height(t_L) * scale_h * swing_L
-    h_ref_R = _poly_height(t_R) * scale_h * swing_R
+    h_ref_L = _poly_height(t_L) * swing_L
+    h_ref_R = _poly_height(t_R) * swing_R
     h_ref = h_ref_L + h_ref_R
 
-    v_ref_L = _poly_vel(t_L) * scale_h * swing_L
-    v_ref_R = _poly_vel(t_R) * scale_h * swing_R
+    v_ref_L = _poly_vel(t_L) * swing_L
+    v_ref_R = _poly_vel(t_R) * swing_R
     v_ref = v_ref_L + v_ref_R  # (B,)
 
-    foot_height_z = swing_L * l_pos[:, 2] + swing_R * r_pos[:, 2]
-    foot_vel_z    = swing_L * l_vel[:, 2] + swing_R * r_vel[:, 2]
+    foot_height_z = swing_L * l_foot_pos[:, 2] + swing_R * r_foot_pos[:, 2]
+    foot_vel_z    = swing_L * l_foot_vel[:, 2] + swing_R * r_foot_vel[:, 2]
 
     r_foot_height = _phi((foot_height_z - h_ref).unsqueeze(-1), 5.0)
     r_foot_vel    = _phi((foot_vel_z - v_ref).unsqueeze(-1), 3.0)
