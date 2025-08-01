@@ -36,6 +36,16 @@ env:
 
   reward_version: "v2" # v1: old reward, v2: new reward
 
+  terrain_cfg:
+    mesh_type: "plane"        # ← 여기서 trimesh 사용 선언
+    horizontal_scale: 0.5        # (필요시 편집)
+    vertical_scale: 0.5          # (필요시 편집)
+    border_size: 2.0             # (필요시 편집)
+    curriculum: True
+    selected:   false
+    slope_treshold: 0.3
+
+  numStates: 187
 
 sim:
   dt: 0.002 #0.0005 #0.004 # 0.0005 #1/2000 

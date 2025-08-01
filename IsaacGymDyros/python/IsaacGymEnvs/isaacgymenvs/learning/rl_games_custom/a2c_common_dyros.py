@@ -20,6 +20,8 @@ from datetime import datetime
 from tensorboardX import SummaryWriter
 import torch 
 from torch import nn
+import torch.nn.functional as F
+from torch.nn.functional import mse_loss
  
 from time import sleep
 import wandb
@@ -534,10 +536,51 @@ class A2CBase:
 
     def train_epoch(self):
         self.vec_env.set_train_info(self.frame)
-
+#################################################################################
     def train_actor_critic(self, obs_dict, opt_step=True):
-        pass 
+        # 1) 입력 분해
+        #   obs_dict: {'obs': Tensor(B,T,input_dim), 'prev_actions':…, 'rnn_states':…, 'states': priv_seq, …}
+        obs_seq      = obs_dict['obs']              # (B, T, obs_dim)
+        priv_seq     = obs_dict['states']           # (B, T, priv_dim)
+        hidden_state = obs_dict.get('rnn_states')   # (num_layers, B, hidden)
 
+        # 2) 모델 호출 → mu, sigma, value, z, recon, new_hidden
+        mu, sigma, value, z, recon, new_hidden = self.model(obs_seq, priv_seq, hidden_state)
+
+        # 3) 정책 손실, 가치 손실, 엔트로피, KL 계산 (기존 RL-Games 로직 재현)
+        policy_loss, value_loss, entropy, kl, neglogp = super()._compute_ppo_losses(
+            mu, sigma, value, obs_dict, opt_step
+        )
+
+        # 4) Denoising loss (decoder 출력 vs. 마지막 privileged state)
+        denoise_loss = F.mse_loss(recon, obs_dict['states'][:, -1, :])
+
+        # 5) 전체 손실: λᵣ·L_den + L_π + λᵥ·Lᵥ
+        λr = self.config['reg_loss_coef']
+        total_loss = λr * denoise_loss + policy_loss + self.critic_coef * value_loss
+ 
+        # 6) backward & optimizer step
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        if opt_step:
+            self.optimizer.step()
+
+        # 7) 반환값 포맷: 
+        #    a_loss, c_loss, entropy, kl, lr, lr_mul, mu, sigma, b_loss, clip_frac
+        #    (b_loss, clip_frac는 사용하지 않으면 0 또는 None)
+        return (
+            policy_loss.item(),
+            value_loss.item(),
+            entropy.mean().item(),
+            0.0,                             # KL (필요 시 계산)
+            self._get_lr(),                  # 현재 lr
+            1.0,                             # lr_mul (필요 시)
+            mu.detach(),
+            sigma.detach(),
+            0.0,                             # bounds loss
+            0.0                              # clip fraction
+        )
+#################################################################################
     def calc_gradients(self):
         pass
 
@@ -649,6 +692,9 @@ class A2CBase:
 
             step_time_start = time.time()
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
+            if rewards.dim()==3 and rewards.size(1)==1:
+                rewards = rewards.squeeze(1)      # → [4096,2]
+            
             step_time_end = time.time()
 
             step_time += (step_time_end - step_time_start)
@@ -656,11 +702,15 @@ class A2CBase:
             shaped_rewards = self.rewards_shaper(rewards)
 
             if self.value_bootstrap and 'time_outs' in infos:
-                shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
+                vals  = res_dict['values'].squeeze(-1)               # [4096, 1]
+                masks = self.cast_obs(infos['time_outs']).float()    # [4096]
+                shaped_rewards[:,0] += self.gamma * vals * masks     # [4096] vs [4096] 브로드캐스트
+                #shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
 
-            self.experience_buffer.update_data('rewards', n, shaped_rewards)
+            #self.experience_buffer.update_data('rewards', n, shaped_rewards)
+            self.experience_buffer.update_data('rewards', n, shaped_rewards[:, 0:1])
 
-            self.current_rewards += rewards
+            self.current_rewards += rewards[:, 0:1]
             self.current_lengths += 1
 
             #GENE: updating specific rewards for wandb
@@ -1028,6 +1078,10 @@ class ContinuousA2CBase(A2CBase):
                         self.writer.add_scalar(rewards_name + '/step'.format(i), mean_rewards[i], frame)
                         self.writer.add_scalar(rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
                         self.writer.add_scalar(rewards_name + '/time'.format(i), mean_rewards[i], total_time)
+                    for nm, val in zip(self.reward_names, mean_specific_rewards):
+                        self.writer.add_scalar(f'specific_rewards/{nm}/step', val, frame)
+                        self.writer.add_scalar(f'specific_rewards/{nm}/iter', val, epoch_num)
+                        self.writer.add_scalar(f'specific_rewards/{nm}/time', val, total_time)
 
                     self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
                     self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
@@ -1081,7 +1135,7 @@ class ContinuousA2CBase(A2CBase):
                     should_exit = should_exit_t.float().item()
             if should_exit:
                 return self.last_mean_rewards, epoch_num
-    
+    '''
     #GENE : Function for logging wandb
     def log_wandb(
         self,
@@ -1134,6 +1188,7 @@ class ContinuousA2CBase(A2CBase):
             wandb_dict["ep_len_mean"] = mean_lengths.item()
 
             for i in range(self.num_rewards):
+            
                 wandb_dict["rollout/"+reward_names[i]] = specific_mean_rewards[i].item()
             #################
             wandb_dict["time_elapsed"] = int(wandb_time - self.init_wandb_time)
@@ -1148,5 +1203,101 @@ class ContinuousA2CBase(A2CBase):
                 + b_losses[i] * self.bounds_loss_coef)
             wandb_dict["train/loss"] = torch_ext.mean_list(losses).item() #GENE: Total Loss
             #wandb_dict["train/explained_variance"] =  
+            #wandb.log(wandb_dict)
+            ##########################################
+            for i, nm in enumerate(self.reward_names):
+                wandb_dict[f"reward/{nm}"] = specific_mean_rewards[i].item()
+            wandb.log({
+                'loss': loss,
+                'global_step': frame  # step 정보는 이 필드로 남김
+            })
+'''
+    def log_wandb(
+        self,
+        frame,
+        epoch_num,
+        mean_rewards,
+        mean_lengths,
+        a_losses,
+        b_losses,
+        c_losses,
+        entropies,
+        kls,
+        clip_fracs,
+        specific_mean_rewards,
+        reward_names
+    ):
+        # ── WandB 초기화 (최초 1회) ──
+        if self.init_wandb is False:
+            os.environ['WANDB_API_KEY'] = ''
+            wandb.init(project=self.config['name'], tensorboard=False)
+
+            # 주요 파일 저장
+            if self.config['name'] == 'DyrosTocabiWalk':
+                wandb.save(os.path.join(os.getcwd(), 'cfg/task/DyrosTocabiWalk.yaml'), policy="now")
+                wandb.save(os.path.join(os.getcwd(), 'cfg/train/DyrosTocabiWalkPPO.yaml'), policy="now")
+                wandb.save(os.path.join(os.getcwd(), 'tasks/dyros_tocabi_walk.py'), policy="now")
+            if self.config['name'] == 'DyrosTocabiSquat':
+                wandb.save(os.path.join(os.getcwd(), 'cfg/task/DyrosTocabiSquat.yaml'), policy="now")
+                wandb.save(os.path.join(os.getcwd(), 'cfg/train/DyrosTocabiSquatPPO.yaml'), policy="now")
+                wandb.save(os.path.join(os.getcwd(), 'tasks/dyros_tocabi_squat.py'), policy="now")
+            if self.config['name'] == 'TocabiNewWalk':
+                wandb.save(os.path.join(os.getcwd(), 'cfg/task/TocabiNewWalk.yaml'), policy="now")
+                wandb.save(os.path.join(os.getcwd(), 'cfg/train/TocabiNewWalkPPO.yaml'), policy="now")
+                wandb.save(os.path.join(os.getcwd(), 'tasks/tocabi_new_walk.py'), policy="now")
+            if self.config['name'] == 'DyrosDynamicWalk':
+                wandb.save(os.path.join(os.getcwd(), 'cfg/task/DyrosDynamicWalk.yaml'), policy="now")
+                wandb.save(os.path.join(os.getcwd(), 'cfg/train/DyrosDynamicWalkPPO.yaml'), policy="now")
+                wandb.save(os.path.join(os.getcwd(), 'tasks/dyros_dynamic_walk.py'), policy="now")
+
+            wandb.save(os.path.join(os.getcwd(), '../assets/mjcf/dyros_tocabi/xml/dyros_tocabi.xml'), policy="now")
+            wandb.save(os.path.join(os.getcwd(), 'tasks/base/vec_task.py'), policy="now")
+
+            self.init_wandb = True
+            self.init_wandb_time = time.time()
+
+        # ── 주기적 로깅 ──
+        if epoch_num % (self.log_wandb_frequency * self.mini_epochs_num) == 0:
+            wandb_time = time.time()
+            wandb_dict = {}
+
+            # 기본 메트릭
+            wandb_dict["serial_timesteps"] = epoch_num * self.horizon_length
+            wandb_dict["n_updates"]       = epoch_num
+            wandb_dict["total_timesteps"]  = frame
+            wandb_dict["fps"]              = int(frame / (wandb_time - self.init_wandb_time))
+            wandb_dict["ep_reward_mean"]   = mean_rewards.item()
+            wandb_dict["ep_len_mean"]      = mean_lengths.item()
+
+            # rollout 보상 컴포넌트
+            for name, val in zip(reward_names, specific_mean_rewards):
+                wandb_dict[f"rollout/{name}"] = val.item()
+
+            # 학습 손실
+            wandb_dict["time_elapsed"]               = int(wandb_time - self.init_wandb_time)
+            wandb_dict["train/entropy_loss"]         = torch_ext.mean_list(entropies).item()
+            wandb_dict["train/policy_gradient_loss"] = torch_ext.mean_list(a_losses).item()
+            wandb_dict["train/value_loss"]           = torch_ext.mean_list(c_losses).item()
+            wandb_dict["train/kl"]                   = torch_ext.mean_list(kls).item()
+            wandb_dict["train/clip_fracs"]           = torch_ext.mean_list(clip_fracs).item()
+
+            # 전체 loss 재계산
+            losses = []
+            for i in range(len(a_losses)):
+                losses.append(
+                    a_losses[i]
+                    + 0.5 * c_losses[i] * self.critic_coef
+                    - entropies[i] * self.entropy_coef
+                    + b_losses[i] * self.bounds_loss_coef
+                )
+            wandb_dict["train/loss"] = torch_ext.mean_list(losses).item()
+
+            # Actor–Critic 네트워크 외보상(denoise 등)도 포함한 컴포넌트별 보상
+            for name, val in zip(reward_names, specific_mean_rewards):
+                wandb_dict[f"reward/{name}"] = val.item()
+
+            # 글로벌 스텝 정보
+            wandb_dict["global_step"] = frame
+
+            # 최종 로깅
             wandb.log(wandb_dict)
-            

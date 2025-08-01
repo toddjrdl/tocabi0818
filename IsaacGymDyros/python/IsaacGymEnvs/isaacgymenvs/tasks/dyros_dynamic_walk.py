@@ -4,7 +4,7 @@ To Run this code, you must comment out
 part since, this part is worked in pre_physics_step in
 our code!!!!!!!!!!!!!!!!!!!!!!!!!!
 '''
-#0725
+
 import numpy as np
 import os
 import torch
@@ -20,11 +20,13 @@ from isaacgymenvs.utils.terrain import Terrain
 
 # Import the reward function
 from .dyros_reward_v2 import compute_humanoid_walk_reward_v2
-
+from isaacgymenvs.utils.height_cnn import HeightCNN
 
 class DyrosDynamicWalk(VecTask):
 
     def __init__(self, cfg, sim_device, graphics_device_id, headless):
+        self.device = torch.device(sim_device) if isinstance(sim_device, str) else sim_device
+        
         self.cfg = cfg
 
         self.randomization_params = self.cfg["task"]["randomization_params"]
@@ -40,21 +42,36 @@ class DyrosDynamicWalk(VecTask):
         self.num_obs_skip = self.cfg["env"]["NumSkip"]
         self.initial_height = self.cfg["env"]["initialHieght"]
 
-        self.num_single_step_obs = self.cfg["env"]["NumSingleStepObs"]
         self.num_action = self.cfg["env"]["NumAction"]
-
-        self.cfg["env"]["numObservations"] = (self.num_single_step_obs+self.num_action)*(self.num_obs_his-1)+self.num_single_step_obs
         self.cfg["env"]["numActions"] = self.num_action
         self.perturb = self.cfg["env"]["perturbation"]
+        self.perturb_start_threshold = self.cfg["env"].get("perturb_start_threshold", 0.165)
 
         self.terrain_cfg = TerrainCfg()
         
+        ################################################################
+        # ─── Height-CNN 추가 (self.cfg 등 계산 위) ───
+        self.height_emb_dim = 24
+        self.height_H, self.height_W = 11, 7
+        self.height_cnn = HeightCNN(1, self.height_emb_dim,
+                                    self.height_H, self.height_W).to(self.device)
+
+        self.proprio_dim           = cfg["env"]["NumSingleStepObs"]    # 원래 37
+        self.num_single_step_obs   = self.proprio_dim + self.height_emb_dim  # 37→61
+        cfg["env"]["NumSingleStepObs"] = self.num_single_step_obs      # ← 덮어쓰기
+
+        # 히스토리 포함 총 numObservations (action history 포함)
+        cfg["env"]["numObservations"] = (
+            (self.num_single_step_obs + self.num_action) * (self.num_obs_his - 1)
+            + self.num_single_step_obs
+        )
+        ################################
         self.init_done = False
 
         super().__init__(config=self.cfg, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless)
 
         if self.viewer != None:
-            cam_pos = gymapi.Vec3(0.0, 0.0, 2.4)
+            cam_pos = gymapi.Vec3(50.0, 25.0, 2.4)
             cam_target = gymapi.Vec3(45.0, 25.0, 0.0)
             self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
         #for PD controll
@@ -200,33 +217,111 @@ class DyrosDynamicWalk(VecTask):
         self.init_done = True
        
     def create_sim(self):
-        self.up_axis_idx = 2 # index of up axis: Y=1, Z=2
-        self.sim = super().create_sim(self.device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
+        self.up_axis_idx = 2  # index of up axis: Y=1, Z=2
+        # 1) 기본 시뮬 생성
+        self.sim = super().create_sim(
+            self.device_id,
+            self.graphics_device_id,
+            self.physics_engine,
+            self.sim_params
+        )
 
+        # 2) Terrain 객체 무조건 생성
+        self.terrain = Terrain(self.terrain_cfg, self.num_envs)
         mesh_type = self.terrain_cfg.mesh_type
-        if mesh_type in ['heightfield', 'trimesh']:
-            self.terrain = Terrain(self.terrain_cfg, self.num_envs)
-        if mesh_type=='plane':
-            self._create_ground_plane()
-        elif mesh_type=='heightfield':
-            self._create_heightfield()
-        elif mesh_type=='trimesh':
-            self._create_trimesh()
-        elif mesh_type is not None:
-            raise ValueError("Terrain mesh type not recognised. Allowed types are [None, plane, heightfield, trimesh]")
-        
-        self._create_envs(self.num_envs, self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
 
-        # If randomizing, apply once immediately on startup before the fist sim step
+        # 3) height_samples 초기화 (plane vs heightfield/trimesh)
+        if mesh_type in ["none", "plane"]:
+            # plane 모드: 0으로 채운 H×W
+            H, W = self.height_H, self.height_W
+            self.height_samples = torch.zeros(
+                (H, W),
+                dtype=torch.float32,
+                device=self.device
+            )
+        else:
+            # heightfield/trimesh 모드: 실제 raw_h 로드
+            raw_h = self.terrain.heightsamples   # int16 numpy array
+            rows, cols = self.terrain.tot_rows, self.terrain.tot_cols
+            self.height_samples = torch.tensor(
+                raw_h,
+                dtype=torch.float32,
+                device=self.device
+            ).view(rows, cols)
+
+        # 4) 지형 형태별 시뮬 지오메트리 생성
+        if mesh_type == 'plane':
+            self._create_ground_plane()
+        elif mesh_type == 'heightfield':
+            self._create_heightfield()
+        elif mesh_type == 'trimesh':
+            self._create_trimesh()
+        else:
+            raise ValueError(
+                "Terrain mesh type not recognised. "
+                "Allowed: [None, plane, heightfield, trimesh]"
+            )
+
+        # 5) environments & actors 생성
+        self._create_envs(
+            self.num_envs,
+            self.cfg["env"]['envSpacing'],
+            int(np.sqrt(self.num_envs))
+        )
+
+        # 6) HEIGHTMAP 샘플링용 로컬 오프셋 계산 (한 번만)
+        border = self.terrain_cfg.border_size
+        xs = torch.linspace(-border, border, steps=self.height_W, device=self.device)
+        ys = torch.linspace(-border, border, steps=self.height_H, device=self.device)
+        grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')  # (H, W)
+        local_offsets = torch.stack([
+            grid_x.flatten(),      # x
+            grid_y.flatten(),      # y
+            torch.zeros_like(grid_x).flatten()  # z
+        ], dim=1)  # (H*W, 3)
+        self.local_points = local_offsets.unsqueeze(0).repeat(
+            self.num_envs, 1, 1
+        )  # (num_envs, H*W, 3)
+
+        # 7) 초기 랜덤화
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
+        # 8) total_mass 계산
         self.total_mass = torch.zeros(self.num_envs, 1, device=self.device)
         for i in range(self.num_envs):
-            robot_props = self.gym.get_actor_rigid_body_properties(self.envs[i], self.humanoid_handles[i])
-            robot_masses = torch.tensor([prop.mass for prop in robot_props], dtype=torch.float, requires_grad=False, device=self.device)
-            self.total_mass[i] = torch.sum(robot_masses)
+            rp = self.gym.get_actor_rigid_body_properties(
+                self.envs[i], self.humanoid_handles[i]
+            )
+            masses = torch.tensor(
+                [prop.mass for prop in rp],
+                dtype=torch.float, device=self.device
+            )
+            self.total_mass[i] = masses.sum()
 
+        # 9) contact_forces 초기화
+        raw_cf = self.gym.acquire_net_contact_force_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        self.contact_forces = gymtorch.wrap_tensor(raw_cf).view(
+            self.num_envs, -1, 3
+        )
+
+        # 10) privileged state dim 및 buffer 재생성
+        cf_dim   = self.contact_forces.shape[1] * 3
+        priv_dim = (
+            self.proprio_dim +   # 37
+            6 + 6 +              # foot pos & vel
+            cf_dim +             # contact forces
+            self.height_emb_dim  # 24
+        )
+        self.cfg["env"]["numStates"] = priv_dim
+        self.states_buf = torch.zeros(
+            (self.num_envs, priv_dim),
+            device=self.device, dtype=torch.float32
+        )
+
+
+        
     def _create_ground_plane(self):
         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
         """
@@ -387,122 +482,123 @@ class DyrosDynamicWalk(VecTask):
         self.dof_limits_lower = to_torch(self.dof_limits_lower, device=self.device)
         self.dof_limits_upper = to_torch(self.dof_limits_upper, device=self.device)
 
+    
+    #주요 수정
     def compute_reward(self):
-        # --- 발 pos/vel 추출 ---
         l_pos = self.body_states[:, self.left_foot_idx, 0:3]
         r_pos = self.body_states[:, self.right_foot_idx, 0:3]
         l_vel = self.body_states[:, self.left_foot_idx, 7:10]
         r_vel = self.body_states[:, self.right_foot_idx, 7:10]
-
-        # 보상 버전에 따른 분기
         if self.cfg["env"].get("reward_version", "v1") == "v2":
-            (self.rew_buf[:], reward, name,
-             self.contact_reward_sum[:]) = compute_humanoid_walk_reward_v2(
-                self.reset_buf,
-                self.progress_buf,
-                self.target_vel,
-                self.root_states,
-                self.target_data_qpos,
-                self.target_data_force,
-                self.dof_pos,
-                self.initial_dof_vel,
-                self.dof_vel,
-                self.pre_joint_velocity_states,
-                self.actions,
-                self.actions_pre,
-                # self.vec_sensor_tensor,
-                # self.pre_vec_sensor_tensor,
-                self.non_feet_idxs,
-                self.contact_forces,
-                self.contact_forces_pre,
-                self.mocap_data_idx,
-                self.termination_height,
-                self.death_cost,
-                self.policy_freq_scale,
-                self.total_mass,
-                self.contact_reward_sum,
-                self.right_foot_idx,
-                self.left_foot_idx,
-                # 최종 네 인자: 발 위치 및 속도
+            # v2: DWL 논문 Table V 보상 (한 번만 호출)
+            total_reward, comp_rewards, names, self.contact_reward_sum[:] = compute_humanoid_walk_reward_v2(
+                self.reset_buf, self.progress_buf, self.target_vel,
+                self.root_states, self.target_data_qpos, self.target_data_force,
+                self.dof_pos, self.initial_dof_vel, self.dof_vel,
+                self.pre_joint_velocity_states, self.actions, self.actions_pre,
+                self.non_feet_idxs, self.contact_forces, self.contact_forces_pre,
+                self.mocap_data_idx, self.termination_height, self.death_cost,
+                self.policy_freq_scale, self.total_mass, self.contact_reward_sum,
+                self.right_foot_idx, self.left_foot_idx,
                 l_pos, r_pos, l_vel, r_vel
             )
+            # scalar reward buffer: [total_reward, perturb_flag]
+            self.rew_buf = torch.cat([total_reward.unsqueeze(-1), self.perturb_start], dim=1)
+            # 컴포넌트별 보상 → extras 로 로깅
+            for idx, nm in enumerate(names):
+                self.extras[nm] = comp_rewards[:, idx]
+            # perturbation flag도 기록
+            self.extras['perturbation'] = self.perturb_start.float().squeeze(-1)
+            # ── WandB 등 downstream 로깅을 위한 stacked/이름 정보 ──
+            self.extras['stacked_rewards'] = comp_rewards
+            reward_names = names + ['perturbation']
+            self.extras['reward_names']   = reward_names
+            # ───────────────────────────────────────────────────────
         else:
-            (self.rew_buf[:], reward, name,
-             self.contact_reward_sum[:]) = compute_humanoid_walk_reward(
-                self.reset_buf,
-                self.progress_buf,
-                self.target_vel,
-                self.root_states,
-                self.target_data_qpos,
-                self.target_data_force,
-                self.dof_pos,
-                self.initial_dof_vel,
-                self.dof_vel,
-                self.pre_joint_velocity_states,
-                self.actions,
-                self.actions_pre,
-                self.non_feet_idxs,
-                self.contact_forces,
-                self.contact_forces_pre,
-                self.mocap_data_idx,
-                self.termination_height,
-                self.death_cost,
-                self.policy_freq_scale,
-                self.total_mass,
-                self.contact_reward_sum,
-                self.right_foot_idx,
-                self.left_foot_idx
-            )
-
-        (self.rew_buf[:], reward, name, self.contact_reward_sum[:]) = compute_humanoid_walk_reward(
-                self.reset_buf,
-                self.progress_buf,
-                self.target_vel,
-                self.root_states,
-                self.target_data_qpos,
-                self.target_data_force,
-                self.dof_pos,
-                self.initial_dof_vel,
-                self.dof_vel,
-                self.pre_joint_velocity_states,
-                self.actions,
-                self.actions_pre,
-                self.non_feet_idxs,
-                self.contact_forces,
-                self.contact_forces_pre,
-                self.mocap_data_idx,
-                self.termination_height,
-                self.death_cost,
-                self.policy_freq_scale,
-                self.total_mass,
-                self.contact_reward_sum,
-                self.right_foot_idx,
-                self.left_foot_idx
-
-        )
-        reward = torch.cat([reward, self.perturb_start], 1)
-
-        if (self.terrain_cfg.curriculum and self.terrain_cfg.mesh_type in ["heightfield", "trimesh"]):
-            for i in range(self.terrain_cfg.num_cols):
-                terrain_idx = (self.terrain_types == i).nonzero(as_tuple=False).squeeze(-1)
-                terrain_level_mean = torch.sum(self.terrain_levels[terrain_idx]) / len(terrain_idx)
-                reward = torch.cat([reward, terrain_level_mean*torch.ones_like(self.terrain_levels).unsqueeze(-1)], 1)
-
-        name.append('perturbation')
-        if (self.terrain_cfg.curriculum and self.terrain_cfg.mesh_type in ["heightfield", "trimesh"]):
-            for i in range(self.terrain_cfg.num_cols):
-                name.append('terrain '+str(i)+' level')
-        self.extras["stacked_rewards"] = reward
-        self.extras["reward_names"] = name
+            # v1: 기존 모션캡처 기반 reward 유지
+            self.rew_buf[:], reward, name, self.contact_reward_sum[:] = \
+                compute_humanoid_walk_reward(
+                    self.reset_buf, self.progress_buf, self.target_vel,
+                    self.root_states, self.target_data_qpos, self.target_data_force,
+                    self.dof_pos, self.initial_dof_vel, self.dof_vel,
+                    self.pre_joint_velocity_states, self.actions, self.actions_pre,
+                    self.non_feet_idxs, self.contact_forces, self.contact_forces_pre,
+                    self.mocap_data_idx, self.termination_height, self.death_cost,
+                    self.policy_freq_scale, self.total_mass, self.contact_reward_sum,
+                    self.right_foot_idx, self.left_foot_idx
+                )
+            # 기존 방식대로 perturb flag append
+            self.rew_buf = torch.cat([reward.unsqueeze(-1), self.perturb_start], dim=1)
+            name.append('perturbation')
+            # terrain reward/이름 처리 그대로 유지
+            if (self.terrain_cfg.curriculum and self.terrain_cfg.mesh_type in ["heightfield", "trimesh"]):
+                for i in range(self.terrain_cfg.num_cols):
+                    terrain_idx = (self.terrain_types == i).nonzero(as_tuple=False).squeeze(-1)
+                    terrain_level_mean = torch.sum(self.terrain_levels[terrain_idx]) / len(terrain_idx)
+                    self.rew_buf = torch.cat([self.rew_buf, terrain_level_mean*torch.ones_like(self.terrain_levels).unsqueeze(-1)], dim=1)
+                    name.append('terrain '+str(i)+' level')
+    # 37+24 = 61-dim observation
+    # privileged 벡터는 37+6+6+cf_dim+24 = 61 + cf_dim
+    # cf_dim = 3 * num_bodies (contact forces)
 
 
+########################################get height samples
+    def get_height_samples(self):
+        if self.terrain_cfg.mesh_type in ["none", "plane"]:
+        # plane 모드: 모두 0으로 리턴
+            B = self.num_envs
+            return torch.zeros(B, self.height_H * self.height_W,
+                            device=self.device, dtype=torch.float32)
+
+        scale = self.terrain_cfg.horizontal_scale
+        vs     = self.terrain_cfg.vertical_scale
+        border = self.terrain_cfg.border_size
+
+        rows, cols = self.height_samples.shape
+
+        max_row = self.terrain.tot_rows - 1 
+        max_col = self.terrain.tot_cols - 1
+
+        xs = ((self.local_points[..., 0] + border) / scale).clamp(0, rows - 1)
+        ys = ((self.local_points[..., 1] + border) / scale).clamp(0, cols - 1)
+        ix = xs.long(); iy = ys.long()
+
+        # 2) nearest-neighbor로 높이 추출 후 vertical_scale 적용
+        #    height_samples는 int16 raw 값이지만, vertical_scale을 곱하면 meter 단위입니다.
+        heights = self.height_samples[ix, iy].to(self.device) * vs  # shape (num_envs, num_samples)
+
+        return heights
+
+        
     def compute_observations(self):
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
         # self.gym.refresh_rigid_body_state_tensor(self.sim)
-        # self.gym.refresh_force_sensor_tensor(self.sim)   
-        self.compute_humanoid_walk_observations()
+        # self.gym.refresh_force_sensor_tensor(self.sim)
+        ################################################################
+        # 1) 기존 37-dim proprio
+        self.compute_humanoid_walk_observations()        # ← 내부에서 self.obs_history 채움
+        o_prop = self.obs_buf[:, -37:]                   # (B,37)
+
+        # 2) height-map CNN 임베딩 24-dim
+        h_raw = self.get_height_samples()        # (B,77)
+        assert h_raw.shape[1] == self.height_H * self.height_W, \
+            f"Expected height samples length {self.height_H*self.height_W}, but got {h_raw.shape[1]}"
+        h_emb = self.height_cnn(h_raw.view(-1,1,self.height_H,self.height_W))
+
+        # 3) obs_buf 최근 스텝(61 dim) 덮어쓰기
+        self.obs_buf[:, -61:] = torch.cat([o_prop, h_emb], dim=1)
+
+        # 4) privileged vec (proprio 37 + 기타 + h_emb 24)
+        foot_pos = self.body_states[:, [self.left_foot_idx, self.right_foot_idx], 0:3].flatten(1)
+        foot_vel = self.body_states[:, [self.left_foot_idx, self.right_foot_idx], 7:10].flatten(1)
+        cf_flat  = self.contact_forces.view(self.num_envs, -1)
+
+        priv_vec = torch.cat([o_prop, foot_pos, foot_vel, cf_flat, h_emb], dim=1)
+        self.states_buf[:] = priv_vec
+        ################################################################
+        
 
     def start_perturbation(self, ids):
         self.pert_on[ids] = True
@@ -555,7 +651,7 @@ class DyrosDynamicWalk(VecTask):
         #                                   self.start_target_vel[:,1] + (self.final_target_vel[:,1]-self.start_target_vel[:,1]) * self.cur_vel_change_duration / self.vel_change_duration, \
         #                                   self.target_vel[:,1])
         
-        if (self.perturb and (torch.mean(self.epi_len_log[:]) > self.max_episode_length - 8/self.dt_policy) and (torch.mean(self.contact_reward_mean[:]) > 0.165)):
+        if self.perturb and torch.mean(self.contact_reward_mean) >= self.perturb_start_threshold:
             self.perturb_start[:, 0] = True
         # self.perturb_start[:, 0] = True
         if (self.perturb_start[0, 0] == True):
@@ -577,8 +673,7 @@ class DyrosDynamicWalk(VecTask):
             stop_torque = self.Kp*(self.initial_dof_pos[:,:] - self.dof_pos[:,:]) + self.Kv*(-self.dof_vel[:,:])
             
             #action_log -> tensor(num_envs, time(current~past 9), dofs(33))
-            #I don't konw why this should be modified;
-            self.action_log[:,0:-1,:] = self.action_log[:,1:,:] .clone()
+            self.action_log[:,0:-1,:] = self.action_log[:,1:,:] 
             self.action_log[:,-1,:] = self.action_torque
             self.simul_len_tensor[:,1] +=1
             self.simul_len_tensor[:,1] = self.simul_len_tensor[:,1].clamp(max=round(0.01/self.dt)+1, min=0)
@@ -613,7 +708,14 @@ class DyrosDynamicWalk(VecTask):
     def post_physics_step(self):
         self.progress_buf += 1
         self.randomize_buf += 1
-            
+        # Tensor 비교 결과를 스칼라 bool로 바꿔서 if 문에 사용
+        freq = self.randomization_params['frequency']
+        if self.randomize and (self.randomize_buf >= freq).any():
+            # 기존 apply_randomizations 호출(인자 1개)
+            self.apply_randomizations(self.randomization_params)
+            # 전체 버퍼를 리셋하거나, 필요하면 부분 리셋
+            self.randomize_buf = torch.zeros_like(self.randomize_buf)
+
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
@@ -849,16 +951,24 @@ class DyrosDynamicWalk(VecTask):
         # for i in range(num_obs_skip*self.num_obs_his-1):
         #     obs_buffer[i] = obs_buffer[i+1]
         # obs_buffer[-1] = normed_obs.clone()
-        
-        self.obs_history = torch.cat((self.obs_history[:,self.num_single_step_obs:], normed_obs), dim=-1)
+        obs_dim = normed_obs.size(1)
+        self.obs_history = torch.cat((self.obs_history[:, obs_dim:], normed_obs), dim=-1)
 
         epi_start_idx = (self.epi_len == 0)
-        for i in range(self.num_obs_his*self.num_obs_skip):
-            self.obs_history[epi_start_idx,self.num_single_step_obs*i:self.num_single_step_obs*(i+1)] = normed_obs[epi_start_idx,:]
+        total_slices = self.num_obs_his * self.num_obs_skip
+        for i in range(total_slices):
+            start = obs_dim * i
+            end   = obs_dim * (i + 1)
+            self.obs_history[epi_start_idx, start:end] = normed_obs[epi_start_idx]
 
-        for i in range(0, self.num_obs_his):
-            self.obs_buf[:,self.num_single_step_obs*i:self.num_single_step_obs*(i+1)] = \
-                self.obs_history[:,self.num_single_step_obs*(self.num_obs_skip*(i+1)-1):self.num_single_step_obs*(self.num_obs_skip*(i+1))]
+
+        for i in range(self.num_obs_his):
+            start = obs_dim * i
+            end   = obs_dim * (i + 1)
+            hist_start = obs_dim * (self.num_obs_skip*(i+1) - 1)
+            hist_end   = obs_dim * (self.num_obs_skip*(i+1))
+            self.obs_buf[:, start:end] = self.obs_history[:, hist_start:hist_end]
+
        
         action_start_idx = self.num_single_step_obs*self.num_obs_his
         for i in range(self.num_obs_his-1):
