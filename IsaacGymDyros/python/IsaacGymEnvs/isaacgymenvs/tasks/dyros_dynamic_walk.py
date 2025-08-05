@@ -545,28 +545,33 @@ class DyrosDynamicWalk(VecTask):
 ########################################get height samples
     def get_height_samples(self):
         if self.terrain_cfg.mesh_type in ["none", "plane"]:
-        # plane 모드: 모두 0으로 리턴
-            B = self.num_envs
-            return torch.zeros(B, self.height_H * self.height_W,
-                            device=self.device, dtype=torch.float32)
+            return torch.zeros(self.num_envs, self.height_H*self.height_W, device=self.device)
 
-        scale = self.terrain_cfg.horizontal_scale
-        vs     = self.terrain_cfg.vertical_scale
-        border = self.terrain_cfg.border_size
+        # 1) root quaternion → yaw 추출
+        # root_states[:,3:7]이 (x, y, z, w) 형식의 쿼터니언이라면:
+        q = self.root_states[:, 3:7]                      # (Nenv, 4)
+        # z축 회전(yaw)만 쓰기 위해 euler로 변환
+        _, _, yaw = quat2euler(q)                         # (Nenv,), radians
 
-        rows, cols = self.height_samples.shape
+        # 2) cos/sin 준비
+        cosy = torch.cos(yaw)[:, None]                    # (Nenv,1)
+        siny = torch.sin(yaw)[:, None]
 
-        max_row = self.terrain.tot_rows - 1 
-        max_col = self.terrain.tot_cols - 1
+        # 3) 로컬 오프셋 회전
+        px = self.local_points[..., 0]                    # (Nenv, H*W)
+        py = self.local_points[..., 1]
+        rot_x =  cosy * px - siny * py                    # (Nenv, H*W)
+        rot_y =  siny * px + cosy * py
 
-        xs = ((self.local_points[..., 0] + border) / scale).clamp(0, rows - 1)
-        ys = ((self.local_points[..., 1] + border) / scale).clamp(0, cols - 1)
-        ix = xs.long(); iy = ys.long()
+        # 4) world-frame 위치 = root_pos_xy + scaled & bordered rot_*
+        root_xy = self.root_states[:, None, 0:2]          # (Nenv,1,2)
+        pts_x = (rot_x + root_xy[..., 0] + border) / scale
+        pts_y = (rot_y + root_xy[..., 1] + border) / scale
 
-        # 2) nearest-neighbor로 높이 추출 후 vertical_scale 적용
-        #    height_samples는 int16 raw 값이지만, vertical_scale을 곱하면 meter 단위입니다.
-        heights = self.height_samples[ix, iy].to(self.device) * vs  # shape (num_envs, num_samples)
+        ix = pts_x.clamp(0, rows-1).long()
+        iy = pts_y.clamp(0, cols-1).long()
 
+        heights = self.height_samples[ix, iy].to(self.device) * vs
         return heights
 
         
@@ -673,7 +678,7 @@ class DyrosDynamicWalk(VecTask):
             stop_torque = self.Kp*(self.initial_dof_pos[:,:] - self.dof_pos[:,:]) + self.Kv*(-self.dof_vel[:,:])
             
             #action_log -> tensor(num_envs, time(current~past 9), dofs(33))
-            self.action_log[:,0:-1,:] = self.action_log[:,1:,:] 
+            self.action_log[:,0:-1,:] = self.action_log[:,1:,:].clone()
             self.action_log[:,-1,:] = self.action_torque
             self.simul_len_tensor[:,1] +=1
             self.simul_len_tensor[:,1] = self.simul_len_tensor[:,1].clamp(max=round(0.01/self.dt)+1, min=0)

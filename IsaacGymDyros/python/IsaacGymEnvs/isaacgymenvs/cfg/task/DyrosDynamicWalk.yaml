@@ -19,7 +19,7 @@ env:
   NumHis : 10
   NumSkip : 2
 
-  initialHieght: 0.93
+  initialHeight: 0.93
   cameraFollow: True
 
   # cost parameters

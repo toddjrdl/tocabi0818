@@ -1,3 +1,12 @@
+_defaults:
+  - _self_
+  - override hydra/job_logging: default
+  - override hydra/hydra_logging: default
+  - task: DyrosDynamicWalk
+  - algo: a2c_continuous
+  - model: continuous_a2c_logstd_dyros
+  - reward_shaper: default_rewards
+
 hydra:
   run:
     dir: ./runs/${task.name}
@@ -13,14 +22,28 @@ params:
 
   algo:
     name: a2c_continuous
+    mini_epochs_num: 4
+    gamma: 0.99
+
+  reward_shaper:
+    scale_value: 1.0
 
   model:
     name: continuous_a2c_logstd_dyros
+    rnn_hidden: 256
     latent_dim: 24
+    reg_loss_coef: 0.0005
 
   network:
-    name: actor_critic_dyros
+    name: dyros_actor_critic
     separate: False
+
+    rnn:
+      name: gru
+      units: 256
+      layers: 1
+      before_mlp: false
+      concat_input: true
 
     space:
       continuous:
@@ -34,7 +57,7 @@ params:
         sigma_last:
           name: const_initializer
           val: -2.9957
-        fixed_sigma: True
+        fixed_sigma: False
 
 
       initializer:
@@ -70,10 +93,12 @@ params:
   load_checkpoint: ${if:${...checkpoint},True,False} # flag which sets whether to load the checkpoint
   load_path: ${...checkpoint} # path to the checkpoint to load
 
+  env_name: rlgpu
+
   config:
     name: ${resolve_default:DyrosDynamicWalk,${....experiment}}
     full_experiment_name: ${.name}
-    env_name: rlgpu
+    #env_name: rlgpu
     multi_gpu: False
     mixed_precision: True
     normalize_input: False #default = True

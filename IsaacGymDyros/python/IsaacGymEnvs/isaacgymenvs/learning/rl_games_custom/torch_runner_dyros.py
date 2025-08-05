@@ -12,6 +12,8 @@ from rl_games.common import tr_helpers
 from isaacgymenvs.learning.rl_games_custom import network_builder_dyros
 from isaacgymenvs.learning.rl_games_custom import a2c_continuous_seperate
 from isaacgymenvs.learning.rl_games_custom import model_builder_dyros
+from isaacgymenvs.learning.rl_games_custom.a2c_common_dyros import ContinuousA2CBase
+
 from rl_games.algos_torch import a2c_discrete
 from rl_games.algos_torch import players
 from rl_games.common.algo_observer import DefaultAlgoObserver
@@ -20,7 +22,7 @@ from rl_games.algos_torch import sac_agent
 class RunnerDyros:
     def __init__(self, algo_observer=None):
         self.algo_factory = object_factory.ObjectFactory()
-        self.algo_factory.register_builder('a2c_continuous', lambda **kwargs : a2c_continuous_seperate.A2CAgent(**kwargs))
+        self.algo_factory.register_builder('a2c_continuous', lambda **kwargs : ContinuousA2CBase(**kwargs))# 수정됨
         self.algo_factory.register_builder('a2c_discrete', lambda **kwargs : a2c_discrete.DiscreteA2CAgent(**kwargs)) 
         self.algo_factory.register_builder('sac', lambda **kwargs: sac_agent.SACAgent(**kwargs))
         #self.algo_factory.register_builder('dqn', lambda **kwargs : dqnagent.DQNAgent(**kwargs))
@@ -40,8 +42,11 @@ class RunnerDyros:
 
     def reset(self):
         pass
-
+    '''
     def load_config(self, params):
+        if 'params' in params and isinstance(params['params'], dict):
+            params = params['params']
+
         self.seed = params.get('seed', None)
 
         self.algo_params = params['algo']
@@ -59,28 +64,131 @@ class RunnerDyros:
             print(params['load_path'])
             self.load_path = params['load_path']
 
-        self.model = self.model_builder.load(params)
-        self.config = copy.deepcopy(params['config'])
+        #self.model = self.model_builder.load(params)
+        #self.config = copy.deepcopy(params['config'])
         
-        self.config['reward_shaper'] = tr_helpers.DefaultRewardsShaper(**self.config['reward_shaper'])
-        self.config['network'] = self.model
+        #self.config['reward_shaper'] = tr_helpers.DefaultRewardsShaper(**self.config['reward_shaper'])
+        self.config = copy.deepcopy(params)
+      
+        task_cfg = params.get('task', {})
+        env_cfg  = task_cfg.get('env', {})
+        # 2) 네트워크 빌더용 인자들 주입
+        self.config['input_shape']  = (env_cfg['NumSingleStepObs'],)
+        self.config['priv_dim']     = env_cfg.get('priv_dim', 181)
+        self.config['actions_num']  = env_cfg['NumAction']
+
+        mdl = self.config.get('model', {})
+        self.config['rnn_hidden']   = mdl.get('rnn_hidden', 256)
+        self.config['z_dim']        = mdl.get('latent_dim', 24)
+
+
+
+        self.config['algo']    = params.get('algo', {})
+        self.config['ppo']     = self.config['algo']
+        self.config['model']   = params.get('model', {})
+        self.config['network'] = params.get('network', {})
+
+        self.config.setdefault('lr_schedule',        'linear')
+        self.config.setdefault('learning_rate',      1e-4)
+        self.config.setdefault('use_estimator_network', False)
         
-        has_rnd_net = self.config.get('rnd_config', None) != None
+        if 'env_name' not in self.config:
+            # Hydra override로 넘어온 task key를 쓰거나, 기본값 지정
+            self.config['env_name'] = params.get('task', 'DyrosDynamicWalk')
+        self.config['reward_shaper'] = tr_helpers.DefaultRewardsShaper(
+            **self.config['reward_shaper']
+        )
+        self.config['num_actors'] = self.config.get('env', {}).get('num_envs', 4096)
+
+        #self.model = self.model_builder.load(self.config)
+        #if hasattr(self.model, 'build'):
+        #    self.model.build(self.config)
+        # 
+        #self.config['network'] = self.model
+        
+        has_rnd_net = 'rnd_config' in self.config
         if has_rnd_net:
             print('Adding RND Network')
-            network = self.model_builder.network_factory.create(params['config']['rnd_config']['network']['name'])
-            network.load(params['config']['rnd_config']['network'])
+            rnd_net_cfg = self.config['rnd_config']['network']
+            network = self.model_builder.network_factory.create(rnd_net_cfg['name'])
+            network.load(rnd_net_cfg)
             self.config['rnd_config']['network'] = network
         
-        has_central_value_net = self.config.get('central_value_config', None) != None
+        has_central_value_net = 'central_value_config' in self.config
         if has_central_value_net:
             print('Adding Central Value Network')
-            network = self.model_builder.network_factory.create(params['config']['central_value_config']['network']['name'])
-            network.load(params['config']['central_value_config']['network'])
+            cv_cfg = self.config['central_value_config']['network']
+            network = self.model_builder.network_factory.create(cv_cfg['name'])
+            network.load(cv_cfg)
             self.config['central_value_config']['network'] = network
+    '''
+    def load_config(self, full_conf):
+        """
+        full_conf: Hydra가 로드한 전체 설정(dict)
+        core      = full_conf.get('params', full_conf)
+                    여기 안에 seed, algo, model, network, load_checkpoint, load_path 등이 들어갑니다.
+        task_cfg  = full_conf.get('task', {})
+                    여기 안에 env 블록(DyrosDynamicWalk.yaml의 env:)이 들어있습니다.
+        """
+        # ─── 0) core 언랩 ───────────────────────────────────
+        core = full_conf.get('params', full_conf)
+
+        # ─── 1) 시드, 체크포인트 로드 여부 ────────────────────
+        self.seed             = core.get('seed', None)
+        self.load_check_point = core.get('load_checkpoint', False)
+        if self.load_check_point:
+            print('Found checkpoint')
+            print(core.get('load_path'))
+
+        # ─── 2) 알고리즘/모델 정보 ───────────────────────────
+        self.algo_params = core['algo']
+        self.algo_name   = self.algo_params['name']
+        mdl             = core.get('model', {})
+
+        # ─── 3) 환경(env) 파라미터 ──────────────────────────
+        task_cfg = full_conf.get('task', {})
+        env_cfg  = task_cfg.get('env', {})
+        # proprio(37) + heightCNN(24) = 61
+        self.config['input_shape'] = (env_cfg['NumSingleStepObs'],)
+        self.config['priv_dim']    = env_cfg.get('priv_dim', 181)
+        self.config['actions_num'] = env_cfg['NumAction']
+
+        # ─── 4) 네트워크 차원 ───────────────────────────────
+        self.config['rnn_hidden'] = mdl.get('rnn_hidden', 256)
+        self.config['z_dim']      = mdl.get('latent_dim', 24)
+
+        # ─── 5) 나머지 블록 병합 ───────────────────────────
+        self.config['algo']    = self.algo_params
+        self.config['ppo']     = self.algo_params
+        self.config['model']   = mdl
+        self.config['network'] = core.get('network', {})
+
+        # ─── 6) 기타 기본값 설정 ───────────────────────────
+        self.config.setdefault('lr_schedule',         'linear')
+        self.config.setdefault('learning_rate',       1e-4)
+        self.config.setdefault('use_estimator_network', False)
+
+        # ─── 7) reward_shaper, num_actors ──────────────────
+        self.config['reward_shaper'] = tr_helpers.DefaultRewardsShaper(
+            **core['config']['reward_shaper']
+        )
+        self.config['num_actors'] = env_cfg.get('num_envs', 4096)
+
+        # ─── 8) RND / Central Value 네트워크 로딩 ──────────
+        if 'rnd_config' in core:
+            rnd_cfg = core['rnd_config']['network']
+            net = self.model_builder.network_factory.create(rnd_cfg['name'])
+            net.load(rnd_cfg)
+            self.config['rnd_config']['network'] = net
+
+        if 'central_value_config' in core:
+            cv_cfg = core['central_value_config']['network']
+            net   = self.model_builder.network_factory.create(cv_cfg['name'])
+            net.load(cv_cfg)
+            self.config['central_value_config']['network'] = net
 
     def load(self, yaml_conf):
-        self.default_config = yaml_conf['params']
+        self.default_config = yaml_conf
         self.load_config(copy.deepcopy(self.default_config))
 
         if 'experiment_config' in yaml_conf:

@@ -306,7 +306,7 @@ class A2CBase:
 
     def get_action_values(self, obs):
         processed_obs = self._preproc_obs(obs['obs'])
-        self.model.eval()
+        self.set_eval()
         input_dict = {
             'is_train': False,
             'prev_actions': None, 
@@ -343,7 +343,7 @@ class A2CBase:
                 }
                 value = self.get_central_value(input_dict)
             else:
-                self.model.eval()
+                self.set_eval()
                 processed_obs = self._preproc_obs(obs['obs'])
                 input_dict = {
                     'is_train': False,
@@ -526,7 +526,8 @@ class A2CBase:
         self.algo_observer.after_clear_stats()
 
     def update_epoch(self):
-        pass
+        self.epoch_num = getattr(self, 'epoch_num', 0) + 1
+        return self.epoch_num
 
     def train(self):       
         pass
@@ -852,12 +853,29 @@ class A2CBase:
 
 class ContinuousA2CBase(A2CBase):
     def __init__(self, base_name, config):
-        A2CBase.__init__(self, base_name, config)
+        if 'name' not in config:
+            config['name'] = 'ContinuousA2CBase'
+        #A2CBase.__init__(self, base_name, config)
+        #self.model = config['network']
+        # 1) 먼저 부모 A2CBase 초기화
+        super().__init__(base_name, config)
+        self.epoch_num = 0
+
+        # 2) 논문 구조의 Actor–Critic 모델(HeightCNN→GRU→Decoder)을 생성·래핑
+        from .model_builder_dyros import ModelBuilderDyros
+        mb = ModelBuilderDyros()
+        # load() → ModelA2CContinuousLogStdDYROS 인스턴스 반환
+        paper_model = mb.load(config)
+        # build() → inner Network(nn.Module) 래퍼 반환
+        self.model = paper_model.build(config)
+
+        # 3) RNN 사용 여부 플래그
+        self.is_rnn = getattr(self.model, 'is_rnn', False)
         self.is_discrete = False
         action_space = self.env_info['action_space']
         self.actions_num = action_space.shape[0]
         self.bounds_loss_coef = config.get('bounds_loss_coef', None)
-
+        #self.is_rnn = config.get('model', {}).get('rnn_hidden', 0) > 0
         self.clip_actions = config.get('clip_actions', True)
 
         # todo introduce device instead of cuda()
@@ -881,11 +899,16 @@ class ContinuousA2CBase(A2CBase):
 
     def init_tensors(self):
         A2CBase.init_tensors(self)
+        super().init_tensors()
         self.update_list = ['actions', 'neglogpacs', 'values', 'mus', 'sigmas']
         self.tensor_list = self.update_list + ['obses', 'states', 'dones']
+        if self.is_rnn:
+            self.rnn_states = self.model.get_default_rnn_state()
+            self.rnn_states = [s.to(self.ppo_device) for s in self.rnn_states]
 
     def train_epoch(self):
         super().train_epoch()
+        self.epoch_num += 1
 
         self.set_eval()
         play_time_start = time.time()

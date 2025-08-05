@@ -1,4 +1,5 @@
 from rl_games.common import object_factory
+from .network_builder_dyros import A2CDYROSBuilder
 import rl_games.algos_torch
 from rl_games.algos_torch import network_builder
 from isaacgymenvs.learning.rl_games_custom import network_builder_dyros
@@ -29,14 +30,19 @@ class ModelBuilderDyros:
         self.network_factory.register_builder('resnet_actor_critic', lambda **kwargs : network_builder.A2CResnetBuilder())
         self.network_factory.register_builder('rnd_curiosity', lambda **kwargs : network_builder.RNDCuriosityBuilder())
         self.network_factory.register_builder('soft_actor_critic', lambda **kwargs: network_builder.SACBuilder())
-        self.network_factory.register_builder('actor_critic_dyros', lambda **kwargs: network_builder_dyros.A2CDYROSBuilder())
+        self.network_factory.register_builder('dyros_actor_critic', lambda **kwargs: A2CDYROSBuilder().load(kwargs))
 
     def load(self, params):
         self.model_name = params['model']['name']
         self.network_name = params['network']['name']
 
-        network = self.network_factory.create(self.network_name)
-        network.load(params['network'])
+        net_params = params.copy()
+        net_params.pop('name', None)
+        network = self.network_factory.create(
+            self.network_name,
+            **net_params
+        )
+
         model = self.model_factory.create(self.model_name, network=network)
 
         return model

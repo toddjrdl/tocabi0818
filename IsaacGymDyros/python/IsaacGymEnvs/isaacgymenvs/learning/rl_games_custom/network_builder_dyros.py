@@ -1,3 +1,5 @@
+from isaacgymenvs.utils.actor_critic_dyros import DyrosActorCritic
+'''
 from rl_games.algos_torch.network_builder import NetworkBuilder
 from rl_games.algos_torch import torch_ext
 import torch
@@ -87,9 +89,9 @@ class A2CDYROSBuilder(NetworkBuilder):
 
             if self.is_discrete:
                 self.logits = torch.nn.Linear(out_size, actions_num)
-            '''
+            
                 for multidiscrete actions num is a tuple
-            '''
+            
             if self.is_multi_discrete:
                 self.logits = torch.nn.ModuleList([torch.nn.Linear(out_size, num) for num in actions_num])
             if self.is_continuous:
@@ -299,49 +301,137 @@ class A2CDYROSBuilder(NetworkBuilder):
                 else:
                     return (torch.zeros((num_layers, self.num_seqs, rnn_units)),)                
 
+
         def load(self, params):
-            self.separate = params.get('separate', False)
-            self.units = params['mlp']['units']
-            self.activation = params['mlp']['activation']
-            self.initializer = params['mlp']['initializer']
-            self.is_d2rl = params['mlp'].get('d2rl', False)
-            self.norm_only_first_layer = params['mlp'].get('norm_only_first_layer', False)
-            self.value_activation = params.get('value_activation', 'None')
-            self.normalization = params.get('normalization', None)
-            self.has_rnn = 'rnn' in params
-            self.has_space = 'space' in params
-            self.central_value = params.get('central_value', False)
-            self.joint_obs_actions_config = params.get('joint_obs_actions', None)
-
-            if self.has_space:
-                self.is_multi_discrete = 'multi_discrete'in params['space']
-                self.is_discrete = 'discrete' in params['space']
-                self.is_continuous = 'continuous'in params['space']
-                if self.is_continuous:
-                    self.space_config = params['space']['continuous']
-                elif self.is_discrete:
-                    self.space_config = params['space']['discrete']
-                elif self.is_multi_discrete:
-                    self.space_config = params['space']['multi_discrete']
+            # 모델·네트워크 이름
+            self.model_name   = params['model']['name']
+            self.network_name = params['network']['name']
+    
+            # 1) 공통 차원 추출
+            obs_dim  = params['env']['NumSingleStepObs']     # 이미 proprio+height=61
+            act_dim  = params['env']['NumAction']
+    
+            # 2) 'dyros_actor_critic' 만 직접 생성하여 빌더를 우회
+            if self.network_name == 'dyros_actor_critic':
+                from isaacgymenvs.learning.rl_games_custom.actor_critic_dyros import DyrosActorCritic
+    
+                # 논문 원형 Actor–Critic–Decoder 네트워크
+                net = DyrosActorCritic(
+                    num_obs   = obs_dim,
+                    priv_dim  = params['env']['priv_dim'],
+                    num_actions = act_dim,
+                    rnn_hidden  = params['model']['rnn_hidden'],
+                    z_dim       = params['model']['latent_dim']
+                )
+                net.load(params['network'])
+                network = net
             else:
-                self.is_discrete = False
-                self.is_continuous = False
-                self.is_multi_discrete = False
-     
-            if self.has_rnn:
-                self.rnn_units = params['rnn']['units']
-                self.rnn_layers = params['rnn']['layers']
-                self.rnn_name = params['rnn']['name']
-                self.rnn_ln = params['rnn'].get('layer_norm', False)
-                self.is_rnn_before_mlp = params['rnn'].get('before_mlp', False)
-                self.rnn_concat_input = params['rnn'].get('concat_input', False)
-
-            if 'cnn' in params:
-                self.has_cnn = True
-                self.cnn = params['cnn']
-            else:
-                self.has_cnn = False
+                # 나머지 네트워크는 factory에 맡겨서 생성
+                network = self.network_factory.create(
+                    self.network_name,
+                    input_shape = (obs_dim,),
+                    actions_num = act_dim,
+                    value_size  = value_sz,
+                    num_seqs    = seq_len
+                )
+                network.load(params['network'])
+    
+            # 3) 마지막으로 모델 생성
+            model = self.model_factory.create(self.model_name, network=network)
+            return model
 
     def build(self, name, **kwargs):
-        net = A2CDYROSBuilder.Network(self.params, **kwargs)
-        return net
+        # 논문 구현을 쓰고자 하면 network.name='dyros_actor_critic' 으로 지정
+        if name == 'dyros_actor_critic':
+            # load() 시 저장한 self.params 에서 직접 차원 정보 읽어오기
+            num_obs     = kwargs['input_shape'][0]
+            priv_dim    = kwargs['priv_dim']
+            num_actions = kwargs['actions_num']
+            rnn_hidden  = kwargs['rnn_hidden']
+            z_dim        = kwargs['z_dim']
+            return DyrosActorCritic(
+                num_obs     = num_obs,
+                priv_dim    = priv_dim,
+                num_actions = num_actions,
+                rnn_hidden  = rnn_hidden,
+                z_dim        = z_dim
+            )
+
+        # 그 외 기본 A2CBuilder.Network 에 위 kwargs 를 그대로 전달
+        return A2CDYROSBuilder.Network(self.params, **kwargs)
+'''
+import torch
+import torch.nn as nn
+
+from isaacgymenvs.utils.actor_critic_dyros import DyrosActorCritic
+from rl_games.algos_torch.network_builder import NetworkBuilder
+
+
+class A2CDYROSBuilder(NetworkBuilder):
+    """
+    Custom NetworkBuilder for Dyros actor-critic networks.
+    Overrides build and load to separate network construction and weight loading.
+    """
+    def __init__(self, **kwargs):
+        super().__init__()
+
+    def build(self, name, *args, **kwargs):
+        """
+        Construct network instances by name.
+
+        If name=='dyros_actor_critic', builds the custom DyrosActorCritic network
+        using parameters passed via kwargs.
+        Otherwise, delegates to the base NetworkBuilder.
+        """
+        # 전달된 환경 및 모델 설정을 params로 저장
+        self.params = kwargs
+
+        if name == 'dyros_actor_critic':
+            # Only build custom DyrosActorCritic when full env/model configs are provided
+            if 'env' in kwargs and 'model' in kwargs:
+                env_cfg   = self.params.get('env', {})
+                model_cfg = self.params.get('model', {})
+                return DyrosActorCritic(
+                    num_obs     = env_cfg['NumSingleStepObs'],
+                    priv_dim    = env_cfg['priv_dim'],
+                    num_actions = env_cfg['NumAction'],
+                    rnn_hidden  = model_cfg['rnn_hidden'],
+                    z_dim        = model_cfg['latent_dim']
+                )
+                    # Fallback: if configs are missing, defer to base builder
+            else:
+                return super().build(name, *args, **kwargs)
+        # Fallback for other network types
+        return super().build(name, *args, **kwargs)
+
+    def load(self, params):
+        """
+        Initialize builder with full params, build network, and load its weights.
+
+        Expects params dict with structure:
+            {
+                'network': {
+                    'name': <network name>,
+                    'state_dict': <state_dict>
+                },
+                'env': { ... },
+                'model': { ... }
+            }
+
+        Returns:
+            network (nn.Module): built network with loaded weights
+        """
+        # 전체 설정 저장
+        #self.params = params
+        net_cfg = params.get('network', {})
+        name = net_cfg.get('name')
+
+        # Build network instance with env/model configs
+        network = self.build(name, **params)
+
+        # Load weights if provided
+        state_dict = net_cfg.get('state_dict', {})
+        if state_dict:
+            network.load_state_dict(state_dict)
+
+        return network
