@@ -14,8 +14,14 @@ env:
 
   NumSingleStepObs: 37
   NumAction: 13
+  #numStates: 187
+  height_emb_dim: 24
+  numObservations: 61
+  reward_version: v2 # v1: old reward, v2: new reward
 
-  perturbation: True #False for default
+  perturbation: False #False for default
+  perturb_start_threshold: 0.35
+  
   NumHis : 10
   NumSkip : 2
 
@@ -26,7 +32,7 @@ env:
   deathCost: 0.0
   terminationHeight: 0.6
 
-  motionfile: 
+ # motionfile: 
 
   asset:
     assetFileName: "mjcf/dyros_tocabi/xml/dyros_tocabi.xml"
@@ -34,7 +40,7 @@ env:
   # set to True if you use camera sensors in the environment
   enableCameraSensors: False
 
-  reward_version: "v2" # v1: old reward, v2: new reward
+  
 
   terrain_cfg:
     mesh_type: "plane"        # ← 여기서 trimesh 사용 선언
@@ -45,7 +51,7 @@ env:
     selected:   false
     slope_treshold: 0.3
 
-  numStates: 187
+  priv_dim: 187
 
 sim:
   dt: 0.002 #0.0005 #0.004 # 0.0005 #1/2000 
@@ -69,10 +75,10 @@ sim:
     contact_collection: 1 # 0: CC_NEVER (don't collect contact info), 1: CC_LAST_SUBSTEP (collect only contacts on last substep), 2: CC_ALL_SUBSTEPS (default - all contacts)
 
 task:
-  randomize: True
+  randomize: False #True
   randomization_params:
     # specify which attributes to randomize for each actor type and property
-    frequency: 1   # Define how many environment steps between generating new randomizations
+    frequency: 2048   # Define how many environment steps between generating new randomizations
     # observations:
     #   range: [0, .005] # range for the white noise
     #   operation: "additive"

@@ -301,7 +301,8 @@ class VecTask(Env):
         """
 
         # randomize actions
-        if self.dr_randomizations.get('actions', None):
+        if self.dr_randomizations.get('actions', None) and \
+           self.cfg.get('env', {}).get('enable_action_noise', False):
             actions = self.dr_randomizations['actions']['noise_lambda'](actions)
 
         action_tensor = torch.clamp(actions, -self.clip_actions, self.clip_actions)
@@ -330,7 +331,8 @@ class VecTask(Env):
         #time2 = time()
         #print('post step', time2 - time1)
         # randomize observations
-        if self.dr_randomizations.get('observations', None):
+        if self.dr_randomizations.get('observations', None) and \
+           self.cfg.get('env', {}).get('enable_obs_noise', False):
             self.obs_buf = self.dr_randomizations['observations']['noise_lambda'](self.obs_buf)
 
         self.extras["time_outs"] = self.timeout_buf.to(self.rl_device)

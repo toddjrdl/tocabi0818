@@ -25,51 +25,53 @@ from isaacgymenvs.utils.height_cnn import HeightCNN
 class DyrosDynamicWalk(VecTask):
 
     def __init__(self, cfg, sim_device, graphics_device_id, headless):
+        # --- 기본 ---
         self.device = torch.device(sim_device) if isinstance(sim_device, str) else sim_device
-        
         self.cfg = cfg
+        env_cfg = self.cfg["env"]
 
+        # --- 시간/히스토리/기본 파라미터 ---
         self.randomization_params = self.cfg["task"]["randomization_params"]
-        self.randomize = self.cfg["task"]["randomize"]
-        self.death_cost = self.cfg["env"]["deathCost"]
-        self.termination_height = self.cfg["env"]["terminationHeight"]
+        self.randomize            = self.cfg["task"]["randomize"]
+        self.death_cost           = env_cfg.get("deathCost", 0.0)
+        self.termination_height   = env_cfg.get("terminationHeight", 0.6)
+        self.debug_viz            = env_cfg.get("enableDebugVis", False)
+        dt = self.cfg["sim"].get("dt")
+        self.max_episode_length_s = env_cfg["episodeLength"]
+        self.max_episode_length   = self.max_episode_length_s / (dt * env_cfg.get("controlFrequencyInv", 8))
+        self.num_obs_his          = env_cfg.get("NumHis", 10)
+        self.num_obs_skip         = env_cfg.get("NumSkip", 2)
+        self.initial_height       = env_cfg.get("initialHeight", env_cfg.get("initialHieght", 0.93))
 
-        self.debug_viz = self.cfg["env"]["enableDebugVis"]
+        # --- 액션 차원(먼저 확정) ---
+        self.num_actions = int(env_cfg.get("NumAction", env_cfg.get("numActions", 13)))
+        env_cfg["NumAction"]  = self.num_actions        # 동기화
+        env_cfg["numActions"] = self.num_actions
+        self.num_action = self.num_actions              # 과거 코드 호환
 
-        self.max_episode_length_s = self.cfg["env"]["episodeLength"]
-        self.max_episode_length = self.max_episode_length_s / (self.cfg["sim"].get("dt") * self.cfg["env"].get("controlFrequencyInv", 8))
-        self.num_obs_his = self.cfg["env"]["NumHis"]
-        self.num_obs_skip = self.cfg["env"]["NumSkip"]
-        self.initial_height = self.cfg["env"]["initialHieght"]
-
-        self.num_action = self.cfg["env"]["NumAction"]
-        self.cfg["env"]["numActions"] = self.num_action
-        self.perturb = self.cfg["env"]["perturbation"]
-        self.perturb_start_threshold = self.cfg["env"].get("perturb_start_threshold", 0.165)
-
-        self.terrain_cfg = TerrainCfg()
         
-        ################################################################
-        # ─── Height-CNN 추가 (self.cfg 등 계산 위) ───
+        # --- HeightCNN & 관측 차원 갱신 ---
         self.height_emb_dim = 24
         self.height_H, self.height_W = 11, 7
-        self.height_cnn = HeightCNN(1, self.height_emb_dim,
-                                    self.height_H, self.height_W).to(self.device)
+        self.height_cnn = HeightCNN(1, self.height_emb_dim, self.height_H, self.height_W).to(self.device)
 
-        self.proprio_dim           = cfg["env"]["NumSingleStepObs"]    # 원래 37
-        self.num_single_step_obs   = self.proprio_dim + self.height_emb_dim  # 37→61
-        cfg["env"]["NumSingleStepObs"] = self.num_single_step_obs      # ← 덮어쓰기
+        self.proprio_dim         = int(env_cfg["NumSingleStepObs"])           # ex) 37
+        self.num_single_step_obs = self.proprio_dim + self.height_emb_dim     # ex) 61
+        env_cfg["NumSingleStepObs"] = self.num_single_step_obs
+        env_cfg["numObservations"]  = self.num_single_step_obs
 
-        # 히스토리 포함 총 numObservations (action history 포함)
-        cfg["env"]["numObservations"] = (
-            (self.num_single_step_obs + self.num_action) * (self.num_obs_his - 1)
-            + self.num_single_step_obs
-        )
-        ################################
+        # --- env 개수: 직접 대입 금지( VecTask 가 설정 ) ---
+        expected_num_envs = int(env_cfg.get("numEnvs", env_cfg.get("num_envs", 4096)))
+
+        self.perturb = env_cfg.get("perturbation", False)
+        self.perturb_start_threshold = env_cfg.get("perturb_start_threshold", 0.165)
+        self.terrain_cfg = TerrainCfg()
         self.init_done = False
 
         super().__init__(config=self.cfg, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless)
-
+        if expected_num_envs and self.num_envs != expected_num_envs:
+            print(f"[WARN] num_envs mismatch: runner={expected_num_envs}, task={self.num_envs}")
+        
         if self.viewer != None:
             cam_pos = gymapi.Vec3(50.0, 25.0, 2.4)
             cam_target = gymapi.Vec3(45.0, 25.0, 0.0)
@@ -125,7 +127,7 @@ class DyrosDynamicWalk(VecTask):
         self.dof_vel[:] = self.initial_dof_vel[:]
 
         self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_state))
-
+        
         #for Deep Mimic
         self.init_mocap_data_idx = torch.zeros(self.num_envs,1,device=self.device, dtype=torch.long)
         self.mocap_data_idx = torch.zeros(self.num_envs,1,device=self.device, dtype=torch.long)
@@ -140,6 +142,7 @@ class DyrosDynamicWalk(VecTask):
         self.dt_policy = self.dt*self.skipframe
         self.policy_freq_scale = 1/(self.dt_policy * 250) # e.g. 100/250
         self.sim_time_scale = self.dt / 0.0005 # e.g. 0.002 / 0.0005 (500Hz, 2000Hz)
+        
 
         #for observation 
         self.qpos_noise = torch.zeros_like(self.dof_pos)
@@ -211,8 +214,19 @@ class DyrosDynamicWalk(VecTask):
         self.actions = torch.zeros(self.num_envs, self.num_action, device=self.device, dtype=torch.float, requires_grad=False)
         self.actions_pre = torch.zeros(self.num_envs, self.num_action, device=self.device, dtype=torch.float, requires_grad=False)
         
-        self.obs_history = torch.zeros(self.num_envs, self.num_obs_his*self.num_obs_skip*self.num_single_step_obs, dtype=torch.float, requires_grad=False, device=self.device)
-        self.action_history = torch.zeros(self.num_envs, self.num_obs_his*self.num_obs_skip*self.num_action, dtype=torch.float, requires_grad=False, device=self.device)
+        self.action_history = torch.zeros(
+            self.num_envs,
+            self.num_obs_his * self.num_obs_skip * self.num_actions,
+            dtype=torch.float32,
+            requires_grad=False,
+            device=self.device
+        )
+        # modified proprioception
+        self.obs_history = torch.zeros(
+            self.num_envs,
+            self.num_obs_his * self.num_obs_skip * self.proprio_dim,  # proprio_dim=37
+            dtype=torch.float32, requires_grad=False, device=self.device
+        )
 
         self.init_done = True
        
@@ -503,16 +517,16 @@ class DyrosDynamicWalk(VecTask):
                 l_pos, r_pos, l_vel, r_vel
             )
             # scalar reward buffer: [total_reward, perturb_flag]
-            self.rew_buf = torch.cat([total_reward.unsqueeze(-1), self.perturb_start], dim=1)
-            # 컴포넌트별 보상 → extras 로 로깅
+            #self.rew_buf = torch.cat([total_reward.unsqueeze(-1), self.perturb_start], dim=1)
+            self.rew_buf[:] = total_reward  # 1 column only
+            # keep this as-is for logging:
             for idx, nm in enumerate(names):
                 self.extras[nm] = comp_rewards[:, idx]
             # perturbation flag도 기록
             self.extras['perturbation'] = self.perturb_start.float().squeeze(-1)
             # ── WandB 등 downstream 로깅을 위한 stacked/이름 정보 ──
             self.extras['stacked_rewards'] = comp_rewards
-            reward_names = names + ['perturbation']
-            self.extras['reward_names']   = reward_names
+            self.extras['reward_names']   = names + ['perturbation']
             # ───────────────────────────────────────────────────────
         else:
             # v1: 기존 모션캡처 기반 reward 유지
@@ -563,6 +577,11 @@ class DyrosDynamicWalk(VecTask):
         rot_x =  cosy * px - siny * py                    # (Nenv, H*W)
         rot_y =  siny * px + cosy * py
 
+        border = self.terrain_cfg.border_size
+        scale  = self.terrain_cfg.horizontal_scale
+        vs     = self.terrain_cfg.vertical_scale
+        rows, cols = self.height_samples.shape  # torch.Size([rows, cols])
+
         # 4) world-frame 위치 = root_pos_xy + scaled & bordered rot_*
         root_xy = self.root_states[:, None, 0:2]          # (Nenv,1,2)
         pts_x = (rot_x + root_xy[..., 0] + border) / scale
@@ -579,7 +598,7 @@ class DyrosDynamicWalk(VecTask):
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
-        # self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
         # self.gym.refresh_force_sensor_tensor(self.sim)
         ################################################################
         # 1) 기존 37-dim proprio
@@ -601,6 +620,16 @@ class DyrosDynamicWalk(VecTask):
         cf_flat  = self.contact_forces.view(self.num_envs, -1)
 
         priv_vec = torch.cat([o_prop, foot_pos, foot_vel, cf_flat, h_emb], dim=1)
+        
+        assert priv_vec.shape[1] > 0, \
+            f"priv_vec is empty: shapes -> o={o_prop.shape}, pos={foot_pos.shape}, vel={foot_vel.shape}, cf={cf_flat.shape}, h={h_emb.shape}"
+
+        # (선택) 만약 states_buf의 크기 계산을 나중에 바꿨다면 여기도 자동 동기화
+        if self.states_buf.shape[1] != priv_vec.shape[1]:
+            # 환경 생성 시 계산한 priv_dim과 실제 합산치가 다르면 재할당
+            self.states_buf = torch.zeros((self.num_envs, priv_vec.shape[1]), device=self.device, dtype=torch.float32)
+            self.cfg["env"]["numStates"] = int(priv_vec.shape[1])        
+        
         self.states_buf[:] = priv_vec
         ################################################################
         
@@ -616,7 +645,8 @@ class DyrosDynamicWalk(VecTask):
         self.pert_on[ids] = False
         self.perturbation_count[ids] = 0
 
-    def pre_physics_step(self, actions):   
+    def pre_physics_step(self, actions):
+        '''   
         local_time = self.time % self.mocap_cycle_period
         local_time_plus_init = (local_time + self.init_mocap_data_idx*self.mocap_cycle_dt) % self.mocap_cycle_period
         self.mocap_data_idx = (self.init_mocap_data_idx + (local_time / self.mocap_cycle_dt).type(torch.long)) % self.mocap_data_num
@@ -636,6 +666,49 @@ class DyrosDynamicWalk(VecTask):
         self.action_history = torch.cat((self.action_history[:,self.num_actions:], self.actions),dim=-1)
 
         self.action_torque = self.actions[:,0:-1] * self.motor_constant_scale[:,0:]*self.action_high[:12]
+        '''
+        # ── 1) 액션 형상 표준화 (최종: [num_envs, num_actions]) ──
+        a = actions
+        if not torch.is_tensor(a):
+            a = torch.as_tensor(a, dtype=torch.float32, device=self.device)
+        else:
+            a = a.to(self.device)
+
+        # (N,1,A) → (N,A)
+        if a.dim() == 3 and a.size(1) == 1:
+            a = a.squeeze(1)
+        # (A,) → (1,A)
+        if a.dim() == 1:
+            a = a.view(1, -1)
+
+        assert a.size(-1) == self.num_actions, \
+            f"action dim mismatch: got {a.size(-1)}, expected {self.num_actions}"
+        if a.size(0) != self.num_envs:
+            raise RuntimeError(
+                f"actions batch={a.size(0)} != num_envs={self.num_envs}. "
+                f"러너의 num_actors가 env.NumEnvs와 같아야 합니다."
+            )
+
+        self.actions = a
+
+        # ── 2) 보조 스칼라(마지막) 양수화 ──
+        self.actions[:, -1].clamp_(min=0)
+
+        # ── 3) 액션 히스토리 갱신 ──
+        hist_width = self.num_actions * self.num_obs_his * self.num_obs_skip
+        if (self.action_history.size(0) != self.num_envs) or (self.action_history.size(1) != hist_width):
+            self.action_history = torch.zeros(self.num_envs, hist_width, device=self.device)
+
+        # 오래된 블록 제거 후 현재 액션 붙이기
+        self.action_history = torch.cat(
+            (self.action_history[:, self.num_actions:], self.actions),
+            dim=-1
+        )
+
+        # ── 4) 토크 계산 ──
+        self.action_torque = (
+            self.actions[:, :-1] * self.motor_constant_scale[:, 0:] * self.action_high[:12]
+        )
 
         # new_vel_idx = torch.nonzero((self.epi_len[:] % (self.max_episode_length/4)) == (self.max_episode_length/4-1))
         # self.vel_change_duration[new_vel_idx] = torch.randint(low=1, high=int(1/self.dt_policy), size=(len(new_vel_idx),1),device=self.device, requires_grad=False)
@@ -659,7 +732,8 @@ class DyrosDynamicWalk(VecTask):
         if self.perturb and torch.mean(self.contact_reward_mean) >= self.perturb_start_threshold:
             self.perturb_start[:, 0] = True
         # self.perturb_start[:, 0] = True
-        if (self.perturb_start[0, 0] == True):
+        #if (self.perturb_start[0, 0] == True):
+        if self.perturb_start.any():
             forces = torch.zeros((self.num_envs, self.num_bodies, 3), device=self.device, dtype=torch.float)
             torques = torch.zeros((self.num_envs, self.num_bodies, 3), device=self.device, dtype=torch.float)
             perturbation_start_idx = torch.nonzero((self.epi_len[:]%(8/self.dt_policy)==self.perturb_timing[:]))
@@ -758,7 +832,7 @@ class DyrosDynamicWalk(VecTask):
     def check_termination(self):
         # reset agents
         # pelvis_height_env_idx  = self.root_states[:, 2] < (self.termination_height + self.env_origins[:,2])
-        
+        '''
         torso_rot = self.root_states[:,3:7].clone()
         identity_rot = torch.zeros_like(torso_rot)
         identity_rot[..., -1] = 1.
@@ -771,6 +845,39 @@ class DyrosDynamicWalk(VecTask):
         reset = torch.where(self.progress_buf >= self.max_episode_length - 1, torch.ones_like(self.reset_buf), reset)
 
         self.reset_buf = torch.where(collision_true, torch.ones_like(self.reset_buf), reset)
+        '''
+        # ── 파라미터(필요시 숫자만 조절) ─────────────────────────────
+        tilt_rad = 0.7                 # 상체 기울기 허용치(≈40도). yaw는 무시
+        nonfoot_force_thres = 50.0     # 발 이외 링크 접촉력 종료 임계치(N)
+        # ────────────────────────────────────────────────────────────
+
+        # 1) 자세 종료: torso z-축이 월드 z-축에서 얼마나 기울었는지로 판단(yaw 무시)
+        torso_rot = self.root_states[:, 3:7]                         # (B,4)
+        world_up = torch.zeros_like(self.root_states[:, :3])         # (B,3)
+        world_up[:, 2] = 1.0
+        # Isaac Gym util: quat_rotate(q, v) 또는 quat_apply(q, v) 사용
+        torso_up = quat_rotate(torso_rot, world_up)                  # (B,3)
+        tilt = torch.acos(torch.clamp(torso_up[:, 2], -1.0, 1.0))    # (B,)
+        orientation_env_idx = tilt > tilt_rad
+
+        # 2) 비(非)발 충돌 종료: 잡음 방지를 위해 임계치를 30N로 상향
+        nf_force = torch.norm(self.contact_forces[:, self.non_feet_idxs, :], dim=2)  # (B, num_nonfeet)
+        collision_true = torch.any(nf_force > nonfoot_force_thres, dim=1)            # (B,)
+
+        # 3) 타임아웃
+        timeout = self.progress_buf >= self.max_episode_length - 1
+
+        # 4) 최종 reset_buf
+        reset = torch.zeros_like(self.reset_buf)
+        reset = torch.where(orientation_env_idx, torch.ones_like(reset), reset)
+        reset = torch.where(collision_true,        torch.ones_like(reset), reset)
+        reset = torch.where(timeout,               torch.ones_like(reset), reset)
+        self.reset_buf = reset
+
+        # (선택) 종료 사유 로깅: 다른 파일 수정 없이도 infos로 나가서 W&B에서 평균 확인 가능
+        self.extras['term/orient']  = orientation_env_idx.float()
+        self.extras['term/coll_nf'] = collision_true.float()
+        self.extras['term/timeout'] = timeout.float()
 
     def reset_idx(self, env_ids):
         # Randomization can happen only at reset time, since it can reset actor positions on GPU
@@ -966,19 +1073,9 @@ class DyrosDynamicWalk(VecTask):
             end   = obs_dim * (i + 1)
             self.obs_history[epi_start_idx, start:end] = normed_obs[epi_start_idx]
 
-
-        for i in range(self.num_obs_his):
-            start = obs_dim * i
-            end   = obs_dim * (i + 1)
-            hist_start = obs_dim * (self.num_obs_skip*(i+1) - 1)
-            hist_end   = obs_dim * (self.num_obs_skip*(i+1))
-            self.obs_buf[:, start:end] = self.obs_history[:, hist_start:hist_end]
-
-       
-        action_start_idx = self.num_single_step_obs*self.num_obs_his
-        for i in range(self.num_obs_his-1):
-            self.obs_buf[:,action_start_idx+self.num_actions*i:action_start_idx+self.num_actions*(i+1)] = \
-                self.action_history[:,self.num_actions*(self.num_obs_skip*(i+1)):self.num_actions*(self.num_obs_skip*(i+1)+1)]
+        # ── 히스토리 제거: 현재 스텝 관측 61차원만 사용 ──
+        #self.obs_buf = torch.cat([normed_obs, h_emb], dim=1)
+        self.obs_buf[:, -normed_obs.size(1):] = normed_obs
                         
 #####################################################################
 ###=========================jit functions=========================###

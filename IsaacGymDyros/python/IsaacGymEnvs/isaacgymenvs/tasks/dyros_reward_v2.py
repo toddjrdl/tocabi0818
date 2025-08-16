@@ -137,14 +137,17 @@ def compute_humanoid_walk_reward_v2(
     # energy ≈ |a| surrogate
     tau   = actions
     omega = joint_velocity_states[:, :actions.size(1)]
-    r_energy = torch.sum(torch.abs(tau * omega), dim=1)
+
+    dof   = actions.size(1)
+    mass = (total_mass.squeeze(-1) + 1e-6)
+    r_energy = torch.sum(torch.abs(tau * omega), dim=1) / (dof * mass)
 
     # action smoothness 
     a_diff = actions - actions_pre   # reuse buffer as aₜ₋₂
-    r_smooth = torch.sum(a_diff * a_diff, dim=1)
+    r_smooth = torch.sum(a_diff * a_diff, dim=1) / dof
 
     # large contact clip penalty
-    r_big_clip = torch.clamp(l_scaled + r_scaled - 1.0, 0.0)
+    r_big_clip = torch.clamp(l_scaled + r_scaled - 2.0, 0.0)
 
     # ------------------------------------------------------------ #
     # stack & weight (Table V)

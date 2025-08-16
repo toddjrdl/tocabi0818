@@ -22,6 +22,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.functional import mse_loss
+import torch.optim as optim
  
 from time import sleep
 import wandb
@@ -103,13 +104,19 @@ class A2CBase:
         self.has_central_value = self.central_value_config is not None
         self.truncate_grads = self.config.get('truncate_grads', False)
         if self.has_central_value:
-            self.state_space = self.env_info.get('state_space', None)
-            if isinstance(self.state_space,gym.spaces.Dict):
-                self.state_shape = {}
-                for k,v in self.state_space.spaces.items():
-                    self.state_shape[k] = v.shape
+            ss = self.env_info.get('state_space', None)
+            if ss is None:
+                # state_space 정보가 없다면 priv_dim으로 fallback
+                self.state_shape = (self.config.get('priv_dim'),)
             else:
-                self.state_shape = self.state_space.shape
+                self.state_shape = ss.shape            
+#            self.state_space = self.env_info.get('state_space', None)
+#            if isinstance(self.state_space,gym.spaces.Dict):
+#                self.state_shape = {}
+#                for k,v in self.state_space.spaces.items():
+#                    self.state_shape[k] = v.shape
+#            else:
+#                self.state_shape = self.state_space.shape
 
         self.self_play_config = self.config.get('self_play_config', None)
         self.has_self_play_config = self.self_play_config is not None
@@ -151,6 +158,9 @@ class A2CBase:
         self.seq_len = self.config.get('seq_length', 4)
         self.normalize_advantage = config['normalize_advantage']
         self.normalize_input = self.config['normalize_input']
+        # set_eval() / set_train() 에서 사용
+        self.running_mean_std = getattr(self, 'running_mean_std', None)
+        self.value_mean_std   = getattr(self, 'value_mean_std', None)
         self.normalize_value = self.config.get('normalize_value', False)
         self.truncate_grads = self.config.get('truncate_grads', False)
         self.has_phasic_policy_gradients = False
@@ -267,26 +277,31 @@ class A2CBase:
         self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(c_losses).item(), frame)
                 
         self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), frame)
-        self.writer.add_scalar('info/last_lr', last_lr * lr_mul, frame)
-        self.writer.add_scalar('info/lr_mul', lr_mul, frame)
-        self.writer.add_scalar('info/e_clip', self.e_clip * lr_mul, frame)
+        self.writer.add_scalar('info/last_lr', last_lr, frame)
+        self.writer.add_scalar('info/lr_mul', 1.0, frame)
+        self.writer.add_scalar('info/e_clip', self.e_clip, frame)
         self.writer.add_scalar('info/kl', torch_ext.mean_list(kls).item(), frame)
         self.writer.add_scalar('info/epochs', epoch_num, frame)
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
     def set_eval(self):
         self.model.eval()
-        if self.normalize_input:
-            self.running_mean_std.eval()
-        if self.normalize_value:
-            self.value_mean_std.eval()
+        rms = getattr(self, 'running_mean_std', None)
+        if rms is not None:
+            rms.eval()
+        vms = getattr(self, 'value_mean_std', None)
+        if vms is not None:
+            vms.eval()
+
 
     def set_train(self):
         self.model.train()
-        if self.normalize_input:
-            self.running_mean_std.train()
-        if self.normalize_value:
-            self.value_mean_std.train()
+        rms = getattr(self, 'running_mean_std', None)
+        if rms is not None:
+            rms.train()
+        vms = getattr(self, 'value_mean_std', None)
+        if vms is not None:
+            vms.train()
 
     def update_lr(self, lr):
         if self.multi_gpu:
@@ -306,11 +321,21 @@ class A2CBase:
 
     def get_action_values(self, obs):
         processed_obs = self._preproc_obs(obs['obs'])
+
+        if 'states' in obs and obs['states'] is not None:
+            input_states = obs['states']
+        else:
+            batch = processed_obs.size(0)
+            priv_dim = self.config.get('priv_dim', self.config.get('env', {}).get('priv_dim'))
+            input_states = torch.zeros(batch, priv_dim, device=self.ppo_device)
+
         self.set_eval()
+        
         input_dict = {
             'is_train': False,
             'prev_actions': None, 
             'obs' : processed_obs,
+            'states'     : input_states,
             'rnn_states' : self.rnn_states
         }
 
@@ -331,26 +356,83 @@ class A2CBase:
         return res_dict
 
     def get_values(self, obs):
+        """
+        Critic(V) 계산. 반드시 privileged state('states')를 함께 넣는다.
+        - obs: dict( {'obs': ..., 'states': ...} ) 또는 텐서
+        - vec_env 래퍼의 깊이가 달라도 states_buf를 최대한 찾아서 사용
+        """
         with torch.no_grad():
+            # 0) 관측 전처리
+            if isinstance(obs, dict):
+                obs_tensor = obs.get('obs', obs)
+            else:
+                obs_tensor = obs
+            processed_obs = self._preproc_obs(obs_tensor)
+
+            # 1) privileged states 찾기
+            def _find_priv_from_anywhere():
+                # 1) obs dict에 이미 있는 경우
+                if isinstance(obs, dict) and ('states' in obs) and (obs['states'] is not None):
+                    return obs['states']
+
+                # 2) vec_env 계층을 넓게 순회
+                roots = []
+                ve = getattr(self, 'vec_env', None)
+                roots += [ve]
+                for r in list(roots):
+                    if r is None:
+                        continue
+                    roots += [getattr(r, k, None) for k in ('env', 'vec_env', 'venv', 'unwrapped')]
+
+                for r in filter(lambda x: x is not None, roots):
+                    # (a) task.states_buf 직접 노출 시 바로 사용
+                    if hasattr(r, 'task') and hasattr(r.task, 'states_buf'):
+                        return r.task.states_buf
+                    if hasattr(r, 'states_buf'):
+                        return r.states_buf
+
+                    # (b) get_privileged_obs가 있더라도 .task가 없으면 호출하지 않음
+                    if hasattr(r, 'get_privileged_obs') and hasattr(r, 'task'):
+                        try:
+                            p = r.get_privileged_obs()
+                            if p is not None:
+                                return p
+                        except AttributeError:
+                            # 일부 래퍼는 .task가 없어 내부에서 AttributeError 발생 → 무시하고 다음 후보 탐색
+                            pass
+                return None
+
+            priv = _find_priv_from_anywhere()
+            if priv is None:
+                raise KeyError("get_values(): privileged 'states'가 없습니다. "
+                            "env에서 states_buf를 갱신/노출하도록 확인하세요.")
+
+            # 2) 차원/디바이스 정리
+            if priv.dim() == 3:
+                priv = priv[:, -1, :]           # [B,T,D] → 현재 시점만 [B,D]
+            elif priv.dim() == 1:
+                priv = priv.unsqueeze(0)        # [D] → [1,D]
+            priv = priv.to(processed_obs.device)
+
+            # 3) RNN state 형식 통일(텐서 → 튜플)
+            rnn_states = self.rnn_states
+            if isinstance(rnn_states, torch.Tensor):
+                rnn_states = (rnn_states,)
+
+            # 4) 모델 호출
+            input_dict = {
+                'is_train': False,
+                'prev_actions': None,
+                'obs': processed_obs,
+                'states': priv,
+                'rnn_states': rnn_states,
+            }
+
             if self.has_central_value:
-                states = obs['states']
                 self.central_value_net.eval()
-                input_dict = {
-                    'is_train': False,
-                    'states' : states,
-                    'actions' : None,
-                    'is_done': self.dones,
-                }
                 value = self.get_central_value(input_dict)
             else:
                 self.set_eval()
-                processed_obs = self._preproc_obs(obs['obs'])
-                input_dict = {
-                    'is_train': False,
-                    'prev_actions': None, 
-                    'obs' : processed_obs,
-                    'rnn_states' : self.rnn_states
-                }
                 result = self.model(input_dict)
                 value = result['values']
 
@@ -404,20 +486,70 @@ class A2CBase:
         return mb_rnn_masks, indices, steps_mask, steps_state, play_mask, mb_rnn_states
 
     def process_rnn_indices(self, mb_rnn_masks, indices, steps_mask, steps_state, mb_rnn_states):
-        seq_indices = None
+        # 종료 조건
         if indices.max().item() >= self.horizon_length:
-            return seq_indices, True
+            return None, True
 
+        # 콜렉션 마스크 갱신
+        if mb_rnn_masks.dtype != torch.float32:
+            mb_rnn_masks = mb_rnn_masks.float()
         mb_rnn_masks[indices + steps_mask] = 1
-        seq_indices = indices % self.seq_len
-        state_indices = (seq_indices == 0).nonzero(as_tuple=False)
-        state_pos = indices // self.seq_len
-        rnn_indices = state_pos[state_indices] + steps_state[state_indices]
 
-        for s, mb_s in zip(self.rnn_states, mb_rnn_states):
-            mb_s[:, rnn_indices, :] = s[:, state_indices, :]
+        # 메타
+        B = int(self.num_agents) * int(self.num_actors)  # 보통 env 수
+        assert B == int(indices.numel()), f"batch 불일치: indices={indices.numel()} vs B={B}"
+        assert (self.horizon_length % self.seq_len) == 0, \
+            f"horizon({self.horizon_length}) % seq_len({self.seq_len}) != 0"
 
-        self.last_rnn_indices = rnn_indices
+        S = self.horizon_length // self.seq_len         # 한 actor당 조각 수
+        N = B * S                                       # 전체 조각 수
+        device = indices.device
+
+        # 이번 스텝에서 '시작 프레임'(t % seq_len == 0)인 actor 선별
+        seq_indices   = torch.remainder(indices, self.seq_len)      # (B,)
+        start_mask    = (seq_indices == 0)
+        state_indices = start_mask.nonzero(as_tuple=False).squeeze(-1)  # (N_start,)
+
+        # 시작하는 actor가 없으면 종료(대부분 step에서 정상)
+        if state_indices.numel() == 0:
+            self.last_rnn_indices   = None
+            self.last_state_indices = None
+            return seq_indices, False
+
+        # 각 actor의 조각 번호와 최종 시퀀스 인덱스 계산
+        seq_id_per_actor = torch.div(indices, self.seq_len, rounding_mode='floor')  # (B,) in [0..S-1]
+        actor_ids        = torch.arange(B, device=device, dtype=torch.long)         # (B,)
+        actor_offsets    = actor_ids * S
+        rnn_indices      = actor_offsets[state_indices] + seq_id_per_actor[state_indices]  # (N_start,)
+
+        # 범위 가드
+        if not (0 <= int(rnn_indices.min()) and int(rnn_indices.max()) < N):
+            raise RuntimeError(
+                f"rnn_indices 범위 오류: [{int(rnn_indices.min())}, {int(rnn_indices.max())}] vs N={N}"
+            )
+
+        # RNN state 복사: [L, B?or1, H] → [L, N, H]
+        for li, (layer_state, layer_mb) in enumerate(zip(self.rnn_states, mb_rnn_states)):
+            # 모양 검증
+            assert layer_state.dim() == 3 and layer_mb.dim() == 3, \
+                f"shape 오류: state={tuple(layer_state.shape)}, mb={tuple(layer_mb.shape)}"
+            assert layer_mb.size(1) == N, \
+                f"mb_rnn_states[{li}].shape[1]={layer_mb.size(1)} != N({N})"
+
+            # 배치축이 1이면 B로 확장 (초기 스텝 호환)
+            if layer_state.size(1) == 1 and B > 1:
+                # expand는 view이므로 그대로 사용 OK(grad 불필요한 hidden cache)
+                s_expanded = layer_state.expand(layer_state.size(0), B, layer_state.size(2))
+            else:
+                s_expanded = layer_state
+                # B 검사(디버그용): 배치축이 1이거나 B와 동일해야 함
+                assert s_expanded.size(1) in (1, B), \
+                    f"unexpected rnn state batch: {s_expanded.size(1)} (expected 1 or {B})"
+
+            # 시작하는 actor들 슬롯에 기록
+            layer_mb[:, rnn_indices, :] = s_expanded[:, state_indices, :]
+
+        self.last_rnn_indices   = rnn_indices
         self.last_state_indices = state_indices
         return seq_indices, False
 
@@ -537,51 +669,167 @@ class A2CBase:
 
     def train_epoch(self):
         self.vec_env.set_train_info(self.frame)
+    
+
 #################################################################################
     def train_actor_critic(self, obs_dict, opt_step=True):
         # 1) 입력 분해
-        #   obs_dict: {'obs': Tensor(B,T,input_dim), 'prev_actions':…, 'rnn_states':…, 'states': priv_seq, …}
-        obs_seq      = obs_dict['obs']              # (B, T, obs_dim)
-        priv_seq     = obs_dict['states']           # (B, T, priv_dim)
+        obs_seq      = obs_dict['obs']              # (B,T,obs_dim)
+        priv_seq     = obs_dict['states']           # (B,T,priv_dim)
         hidden_state = obs_dict.get('rnn_states')   # (num_layers, B, hidden)
 
-        # 2) 모델 호출 → mu, sigma, value, z, recon, new_hidden
-        mu, sigma, value, z, recon, new_hidden = self.model(obs_seq, priv_seq, hidden_state)
+        # 2) 모델 호출: dict 형태로 전달
+        model_in = {
+            'is_train': True,
+            # 'prev_actions'가 별도로 없으면, dataset의 'actions'를 바로 사용
+            'prev_actions': obs_dict.get('prev_actions', obs_dict.get('actions')),
+            'obs':        obs_seq,
+            'states':     priv_seq,
+            'rnn_states': hidden_state,
+        }
+        res = self.model(model_in)
 
-        # 3) 정책 손실, 가치 손실, 엔트로피, KL 계산 (기존 RL-Games 로직 재현)
-        policy_loss, value_loss, entropy, kl, neglogp = super()._compute_ppo_losses(
-            mu, sigma, value, obs_dict, opt_step
-        )
+        # 3) 필요한 값들 꺼내기
+        mu       = res['mus']
+        sigma    = res['sigmas']
+        value    = res['values']
+        # rnn_states는 (new_hidden,) 형태로 오므로 첫 원소만
+        new_hidden = res.get('rnn_states', None)
+        if isinstance(new_hidden, (list, tuple)):
+            new_hidden = new_hidden[0]
+        # denoise용 재구성 출력(모델에서 제공하면 사용)
+        recon = res.get('recon', None)
 
-        # 4) Denoising loss (decoder 출력 vs. 마지막 privileged state)
-        denoise_loss = F.mse_loss(recon, obs_dict['states'][:, -1, :])
+        # 4) PPO 손실들
+        policy_loss, value_loss, entropy, kl, neglogp = self._compute_ppo_losses(res, obs_dict)
 
-        # 5) 전체 손실: λᵣ·L_den + L_π + λᵥ·Lᵥ
+        # 5) Denoising loss (decoder 출력 vs. 마지막 privileged state)
+        if recon is not None:
+            denoise_loss = F.mse_loss(recon, obs_dict['states'][:, -1, :])
+        else:
+            # 모델이 아직 'recon'을 안 돌려주면 denoise는 0으로(학습 진행)
+            denoise_loss = value.detach().sum() * 0.0
+
+        # 6) 전체 손실: λᵣ·L_den + L_π + λᵥ·Lᵥ
         λr = self.config['reg_loss_coef']
-        total_loss = λr * denoise_loss + policy_loss + self.critic_coef * value_loss
- 
-        # 6) backward & optimizer step
+        λπ = self.config.get('policy_coef', 5.0) # 논문 값
+        λv = self.config.get('critic_coef',  5.0) # 논문 값
+        total_loss = λr * denoise_loss + λπ * policy_loss + λv * value_loss - self.entropy_coef * entropy
+        
+        # 7) backward & step
         self.optimizer.zero_grad()
         total_loss.backward()
         if opt_step:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
             self.optimizer.step()
 
-        # 7) 반환값 포맷: 
-        #    a_loss, c_loss, entropy, kl, lr, lr_mul, mu, sigma, b_loss, clip_frac
-        #    (b_loss, clip_frac는 사용하지 않으면 0 또는 None)
-        return (
-            policy_loss.item(),
-            value_loss.item(),
-            entropy.mean().item(),
-            0.0,                             # KL (필요 시 계산)
-            self._get_lr(),                  # 현재 lr
-            1.0,                             # lr_mul (필요 시)
-            mu.detach(),
-            sigma.detach(),
-            0.0,                             # bounds loss
-            0.0                              # clip fraction
-        )
-#################################################################################
+        # 8) 로깅용 값 반환(기존 형식 유지)
+        return (policy_loss.detach(), value_loss.detach(), entropy.detach(), kl.detach(),
+                self.last_lr, self.last_lr_mu,
+                mu.detach(), sigma.detach(),
+                denoise_loss.detach(), self.curr_clip_frac)
+    #################################################################################
+    def _compute_ppo_losses(self, res, batch):
+        import torch
+        import numpy as np
+
+        # --- 모델 출력 ---
+        mu    = res['mus']          # [B,L,A]
+        sigma = res['sigmas']       # [B,L,A]
+        value = res['values']       # [B,L] or [B,L,1]
+        if value.dim() == 3 and value.size(-1) == 1:
+            value = value.squeeze(-1)   # -> [B,L]
+
+        B, L, A = mu.shape
+        N = B * L
+
+        # --- actions 먼저 확보(배치 우선, 없으면 res) ---
+        actions = batch.get('actions', None)
+        if actions is None:
+            actions = res.get('actions', None)
+        if actions is None:
+            raise RuntimeError("compute_ppo_losses: 'actions' not found in batch/res")
+
+        if actions.dim() == 2 and actions.size(0) == N and actions.size(1) == A:
+            actions = actions.view(B, L, A)
+        elif actions.dim() != 3:
+            actions = actions.reshape(B, L, A)   # 마지막 안전망
+
+        # --- 한 번만 평탄화: 스칼라류 -> [N], 벡터류 -> [N,A] ---
+        def flat1(x, name):
+            if x is None: return None
+            if x.dim() == 3 and x.size(-1) == 1:  # [B,L,1] -> [B,L]
+                x = x.squeeze(-1)
+            if x.dim() == 3 and x.size(-1) == A:  # [B,L,A] -> [B,L] (per-dim일 때)
+                x = x.sum(dim=-1)
+            x = x.reshape(-1)                      # -> [N]
+            if x.numel() != N:
+                raise RuntimeError(f"{name}: got {tuple(x.shape)}, expected {N}")
+            return x
+
+        # 벡터형(액션 차원 포함)은 [N,A], 스칼라형은 [N]
+        mu      = mu.reshape(N, A)
+        sigma   = sigma.reshape(N, A)
+        actions = actions.reshape(N, A)
+        value_f = flat1(value, 'value')
+
+        returns    = flat1(batch['returns'], 'returns')
+        advantages = flat1(batch['advantages'], 'advantages')
+        old_values = flat1(batch.get('old_values', batch.get('values', value.detach())), 'old_values')
+
+        old_neg = batch.get('neglogpacs', batch.get('old_neglogp', None))
+        if old_neg is None:
+            old_neg = torch.zeros(N, device=mu.device)
+        else:
+            old_neg = flat1(old_neg, 'old_neg')
+
+        # --- new neglogp (모델이 주면 사용, 없으면 계산) ---
+        if 'prev_neglogp' in res and res['prev_neglogp'] is not None:
+            new_neg = flat1(res['prev_neglogp'], 'new_neg')
+        else:
+            log_std = torch.log(sigma)  # [N,A]
+            new_neg = (
+                0.5 * (((actions - mu) / sigma) ** 2).sum(dim=-1)
+                + 0.5 * np.log(2.0 * np.pi) * A
+                + log_std.sum(dim=-1)
+            )  # [N]
+
+        # --- 엔트로피 ---
+        if 'entropy' in res:
+            entropy = flat1(res['entropy'], 'entropy').mean()
+        else:
+            # Normal(mu,sigma) 엔트로피
+            entropy = (torch.log(sigma).sum(dim=-1) + 0.5 * A * (1.0 + np.log(2.0 * np.pi))).mean()
+
+        # --- 이점 정규화(옵션) ---
+        adv = advantages
+        if getattr(self, 'normalize_advantage', True):
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        # --- PPO clipped objective ---
+        # ratio = exp(logπ_new − logπ_old) = exp(old_neg − new_neg)  (neg = −logπ)
+        ratio = torch.exp(old_neg - new_neg)          # [N]
+        surr1 = ratio * adv
+        surr2 = torch.clamp(ratio, 1.0 - self.e_clip, 1.0 + self.e_clip) * adv
+        policy_loss = -torch.mean(torch.min(surr1, surr2))
+
+        # 로깅용 clip frac
+        self.curr_clip_frac = ((ratio > 1.0 + self.e_clip) | (ratio < 1.0 - self.e_clip)).float().mean()
+
+        # --- value loss (clipped) ---
+        if getattr(self, 'clip_value', True):
+            v_clipped = old_values + (value_f - old_values).clamp(-self.e_clip, self.e_clip)
+            v_loss1   = (value_f - returns) ** 2
+            v_loss2   = (v_clipped - returns) ** 2
+            value_loss = 0.5 * torch.mean(torch.max(v_loss1, v_loss2))
+        else:
+            value_loss = 0.5 * torch.mean((value_f - returns) ** 2)
+
+        # 근사 KL: 0.5 * (Δlogπ)^2 = 0.5 * (new_neg − old_neg)^2
+        approx_kl = 0.5 * torch.mean((new_neg - old_neg) ** 2)
+
+        return policy_loss, value_loss, entropy, approx_kl, new_neg.mean()
+
     def calc_gradients(self):
         pass
 
@@ -634,6 +882,7 @@ class A2CBase:
         return state
 
     def get_stats_weights(self):
+        '''
         state = {}
         if self.normalize_input:
             state['running_mean_std'] = self.running_mean_std.state_dict()
@@ -644,8 +893,18 @@ class A2CBase:
         if self.mixed_precision:
             state['scaler'] = self.scaler.state_dict()
         return state
+        '''
+        state = {}
+        # 입력 정규화
+        rms = getattr(self, 'running_mean_std', None)
+        state['running_mean_std'] = rms.state_dict() if rms is not None else None
+        # 가치/리워드 정규화
+        vms = getattr(self, 'value_mean_std', None)
+        state['reward_mean_std'] = vms.state_dict() if vms is not None else None
+        return state
 
     def set_stats_weights(self, weights):
+        '''
         if self.normalize_input:
             self.running_mean_std.load_state_dict(weights['running_mean_std'])
         if self.normalize_value:
@@ -654,12 +913,61 @@ class A2CBase:
             self.central_value_net.set_stats_weights(weights['assymetric_vf_mean_std'])
         if self.mixed_precision and 'scaler' in weights:
             self.scaler.load_state_dict(weights['scaler'])
+        '''
+        # 입력 정규화
+        rms_sd = weights.get('running_mean_std', None)
+        if rms_sd is not None and getattr(self, 'running_mean_std', None) is not None:
+            self.running_mean_std.load_state_dict(rms_sd)
+        # 가치/리워드 정규화
+        vms_sd = weights.get('reward_mean_std', None)
+        if vms_sd is not None and getattr(self, 'value_mean_std', None) is not None:
+            self.value_mean_std.load_state_dict(vms_sd)    
 
     def set_weights(self, weights):
         self.model.load_state_dict(weights['model'])
         self.set_stats_weights(weights)
+        
+    def save(self, name):
+        """체크포인트 저장: 모델 가중치 + 통계(RMS) 포함."""
+        # 확장자 보정
+        fname = str(name)
+        if not fname.endswith('.pth'):
+            fname += '.pth'
+        os.makedirs(os.path.dirname(fname), exist_ok=True)
+
+        state = {
+            'weights': self.get_weights(),   # {'model': state_dict, 'running_mean_std': ..., 'reward_mean_std': ...}
+            'config': self.config,
+            'epoch': getattr(self, 'epoch_num', None),
+            'frame': getattr(self, 'frame', None),
+        }
+        import torch
+        torch.save(state, fname)
+
+    def restore(self, path):
+        """체크포인트 로드(가능한 여러 포맷을 호환)."""
+        import torch
+        ckpt = torch.load(path, map_location=self.ppo_device)
+
+        if isinstance(ckpt, dict) and 'weights' in ckpt:
+            # 우리가 저장한 포맷
+            self.set_weights(ckpt['weights'])
+        elif isinstance(ckpt, dict) and 'model' in ckpt:
+            # 최소 포맷(모델만)
+            self.model.load_state_dict(ckpt['model'])
+            stats = {}
+            if 'running_mean_std' in ckpt: stats['running_mean_std'] = ckpt['running_mean_std']
+            if 'reward_mean_std'  in ckpt: stats['reward_mean_std']  = ckpt['reward_mean_std']
+            if stats: self.set_stats_weights(stats)
+        else:
+            # 순수 state_dict만 있는 경우
+            self.model.load_state_dict(ckpt)
+
+        if hasattr(self.model, 'to'):
+            self.model.to(self.ppo_device)
 
     def _preproc_obs(self, obs_batch):
+        '''
         if type(obs_batch) is dict:
             for k,v in obs_batch.items():
                 obs_batch[k] = self._preproc_obs(v)
@@ -668,6 +976,11 @@ class A2CBase:
                 obs_batch = obs_batch.float() / 255.0
         if self.normalize_input:
             obs_batch = self.running_mean_std(obs_batch)
+        return obs_batch
+        '''
+            # normalize_input이 꺼져 있으면 running_mean_std는 None일 수 있음
+        if getattr(self, 'running_mean_std', None) is not None:
+            return self.running_mean_std(obs_batch)
         return obs_batch
 
     def play_steps(self):
@@ -679,7 +992,7 @@ class A2CBase:
         for n in range(self.horizon_length):
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
-                res_dict = self.get_masked_action_values(self.obs, masks)
+                res_dict = self.get_asked_action_values(self.obs, masks)
             else:
                 res_dict = self.get_action_values(self.obs)
 
@@ -756,76 +1069,132 @@ class A2CBase:
     def play_steps_rnn(self):
         mb_rnn_states = []
         epinfos = []
+
+        # 버퍼 초기화
         self.experience_buffer.tensor_dict['values'].fill_(0)
         self.experience_buffer.tensor_dict['rewards'].fill_(0)
         self.experience_buffer.tensor_dict['dones'].fill_(1)
 
         step_time = 0.0
-
         update_list = self.update_list
 
         batch_size = self.num_agents * self.num_actors
-        mb_rnn_masks = None
 
-        mb_rnn_masks, indices, steps_mask, steps_state, play_mask, mb_rnn_states = self.init_rnn_step(batch_size, mb_rnn_states)
+        # RNN 인덱스/마스크 초기화
+        mb_rnn_masks, indices, steps_mask, steps_state, play_mask, mb_rnn_states = \
+            self.init_rnn_step(batch_size, mb_rnn_states)
 
+        # -------------------------------------------------
+        # 수집 루프
+        # -------------------------------------------------
         for n in range(self.horizon_length):
-            seq_indices, full_tensor = self.process_rnn_indices(mb_rnn_masks, indices, steps_mask, steps_state, mb_rnn_states)
+            seq_indices, full_tensor = self.process_rnn_indices(
+                mb_rnn_masks, indices, steps_mask, steps_state, mb_rnn_states
+            )
             if full_tensor:
                 break
 
             if self.has_central_value:
                 self.central_value_net.pre_step_rnn(self.last_rnn_indices, self.last_state_indices)
 
+            # 액션/가치 계산
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
                 res_dict = self.get_action_values(self.obs)
- 
-            self.rnn_states = res_dict['rnn_states']
-            self.experience_buffer.update_data_rnn('obses', indices, play_mask, self.obs['obs'])
-            self.experience_buffer.update_data_rnn('dones', indices, play_mask, self.dones.byte())
 
+            # 최신 RNN hidden 유지
+            self.rnn_states = res_dict['rnn_states']
+
+            # 관측/던/값 등 버퍼 기록
+            self.experience_buffer.update_data_rnn('obses',  indices, play_mask, self.obs['obs'])
+            self.experience_buffer.update_data_rnn('dones',  indices, play_mask, self.dones.byte())
             for k in update_list:
+                # 보통 ['values','mus','sigmas','prev_neglogp','entropy','actions'] 등이 들어있음
                 self.experience_buffer.update_data_rnn(k, indices, play_mask, res_dict[k])
 
+            # 중앙가치망을 쓰는 경우 스텝별 privileged state도 저장(가능할 때만)
             if self.has_central_value:
-                self.experience_buffer.update_data_rnn('states', indices[::self.num_agents] ,play_mask[::self.num_agents]//self.num_agents, self.obs['states'])
+                priv_now = None
+                if isinstance(self.obs, dict) and ('states' in self.obs):
+                    priv_now = self.obs['states']
+                elif hasattr(self.vec_env, 'get_privileged_obs'):
+                    priv_now = self.vec_env.get_privileged_obs()
+                elif hasattr(self.vec_env, 'task') and hasattr(self.vec_env.task, 'states_buf'):
+                    priv_now = self.vec_env.task.states_buf
+                if priv_now is not None:
+                    # 다중 에이전트 호환(rl-games의 중앙가치 버퍼 규약)
+                    self.experience_buffer.update_data_rnn(
+                        'states',
+                        indices[::self.num_agents],
+                        play_mask[::self.num_agents] // self.num_agents,
+                        priv_now
+                    )
 
+            # 환경 스텝
             step_time_start = time.time()
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
             step_time_end = time.time()
-
             step_time += (step_time_end - step_time_start)
-
+            ##########################################################################
+            # v2 리워드 구성요소 수집
+            if isinstance(infos, dict):
+                if 'reward_names' in infos and 'stacked_rewards' in infos:
+                    self.reward_names = infos['reward_names']
+                    self.current_specific_rewards = infos['stacked_rewards']
+                elif 'extras' in infos and isinstance(infos['extras'], dict):
+                    ex = infos['extras']
+                    if 'reward_names' in ex and 'stacked_rewards' in ex:
+                        self.reward_names = ex['reward_names']
+                        self.current_specific_rewards = ex['stacked_rewards']
+            # ---------------------------
+            # 보상 정규화 + timeout 부트스트랩 (항상 [B,1] 유지)
+            # ---------------------------
             shaped_rewards = self.rewards_shaper(rewards)
+            if shaped_rewards.dim() == 1:
+                shaped_rewards = shaped_rewards.unsqueeze(1)           # [B] -> [B,1]
+            elif shaped_rewards.dim() == 2 and shaped_rewards.size(1) != 1:
+                shaped_rewards = shaped_rewards[:, :1]                 # [B,K] -> [B,1]
 
-            if self.value_bootstrap and 'time_outs' in infos:
-                shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()          
+            if self.value_bootstrap and ('time_outs' in infos):
+                to_mask = self.cast_obs(infos['time_outs'])
+                if to_mask.dim() == 1:
+                    to_mask = to_mask.unsqueeze(1)                     # [B] -> [B,1]
+                elif to_mask.dim() == 2 and to_mask.size(1) != 1:
+                    to_mask = to_mask[:, :1]                           # [B,2] -> [B,1] (단일 에이전트)
+                else:
+                    to_mask = to_mask.reshape(-1, 1)                   # 기타 -> [B,1]
+                shaped_rewards = shaped_rewards + self.gamma * res_dict['values'] * to_mask.float()
 
+            # ✅ 항상 보상을 기록(이 줄이 if 블록 밖에 있어야 함)
             self.experience_buffer.update_data_rnn('rewards', indices, play_mask, shaped_rewards)
 
+            # 에피소드 통계/던 처리
             self.current_rewards += rewards
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
             done_indices = all_done_indices[::self.num_agents]
 
-            self.process_rnn_dones(all_done_indices, indices, seq_indices)  
+            self.process_rnn_dones(all_done_indices, indices, seq_indices)
             if self.has_central_value:
                 self.central_value_net.post_step_rnn(all_done_indices)
-        
+
             self.algo_observer.process_infos(infos, done_indices)
 
             fdones = self.dones.float()
-            not_dones = 1.0 - self.dones.float()
+            not_dones = 1.0 - fdones
 
             self.game_rewards.update(self.current_rewards[done_indices])
             self.game_lengths.update(self.current_lengths[done_indices])
             self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
             self.current_lengths = self.current_lengths * not_dones
 
-        last_values = self.get_values(self.obs)
+        # -------------------------------------------------
+        # 루프 종료 후 마지막 V(s) 및 어드밴티지 계산
+        # -------------------------------------------------
+        last_values = self.get_values(self.obs)                     # [B,1]
+
         fdones = self.dones.float()
         mb_fdones = self.experience_buffer.tensor_dict['dones'].float()
         mb_values = self.experience_buffer.tensor_dict['values']
@@ -833,25 +1202,143 @@ class A2CBase:
 
         non_finished = (indices != self.horizon_length).nonzero(as_tuple=False)
         ind_to_fill = indices[non_finished]
-        mb_fdones[ind_to_fill,non_finished] = fdones[non_finished]
-        mb_values[ind_to_fill,non_finished] = last_values[non_finished]
+        mb_fdones[ind_to_fill, non_finished] = fdones[non_finished]
+        mb_values[ind_to_fill, non_finished] = last_values[non_finished]
         fdones[non_finished] = 1.0
         last_values[non_finished] = 0
-        
-        mb_advs = self.discount_values_masks(fdones, last_values, mb_fdones, mb_values, mb_rewards, mb_rnn_masks.view(-1,self.horizon_length).transpose(0,1))
+
+        mb_advs = self.discount_values_masks(
+            fdones, last_values, mb_fdones, mb_values, mb_rewards,
+            mb_rnn_masks.view(-1, self.horizon_length).transpose(0, 1)
+        )
         mb_returns = mb_advs + mb_values
 
-        batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
-        batch_dict['returns'] = swap_and_flatten01(mb_returns)
-        batch_dict['rnn_states'] = mb_rnn_states
-        batch_dict['rnn_masks'] = mb_rnn_masks
-        batch_dict['played_frames'] = n * self.num_actors * self.num_agents
-        batch_dict['step_time'] = step_time
+        # 최신 privileged state 캐시 (prepare_dataset에서 못 찾을 경우 대비)
+        try:
+            if hasattr(self.vec_env, 'get_privileged_obs'):
+                self.last_priv_states = self.vec_env.get_privileged_obs().detach().clone()
+            elif hasattr(self.vec_env, 'task') and hasattr(self.vec_env.task, 'states_buf'):
+                self.last_priv_states = self.vec_env.task.states_buf.detach().clone()
+            elif isinstance(self.obs, dict) and ('states' in self.obs):
+                self.last_priv_states = self.obs['states'].detach().clone()
+            else:
+                self.last_priv_states = None
+        except Exception:
+            self.last_priv_states = None
+
+        # 배치 딕셔너리 구성
+        batch_dict = self.experience_buffer.get_transformed_list(
+            swap_and_flatten01, self.tensor_list
+        )
+        batch_dict['returns']     = swap_and_flatten01(mb_returns)
+        batch_dict['rnn_states']  = mb_rnn_states
+        batch_dict['rnn_masks']   = mb_rnn_masks
+        batch_dict['played_frames'] = (n + 1) * self.num_actors * self.num_agents
+        batch_dict['step_time']   = step_time
+
+        # (선택) privileged를 함께 넘겨두면 prepare_dataset이 더 안전
+        if self.last_priv_states is not None:
+            batch_dict['states'] = self.last_priv_states
 
         return batch_dict
 
 
 class ContinuousA2CBase(A2CBase):
+    class _OneBatchDataset:
+        def __init__(self, device, horizon_len, seq_len,
+                    obses, states, actions, returns, old_values, advantages,
+                    neglogpacs, mus, sigmas, rnn_states=None, rnn_masks=None):
+            self.device = device
+            self.horizon_len = horizon_len   # = T
+            self.seq_len = seq_len           # = L
+            self._B = None                   # B(=num_envs) 추론용
+
+            def _reshape_to_seq(x, *, is_states=False):
+                if x is None:
+                    return None
+                # [N] -> [N,1]
+                if x.dim() == 1:
+                    x = x.unsqueeze(-1)
+
+                if x.dim() == 2:  # [N, D]
+                    N, D = x.shape
+                    # B 추론 (obs가 먼저 들어오므로 보통 여기서 B가 잡힘)
+                    if self._B is None:
+                        assert N % self.horizon_len == 0, \
+                            f"N({N}) % horizon_len({self.horizon_len}) != 0"
+                        self._B = N // self.horizon_len
+
+                    # states가 [B, priv_dim]이면 T번 반복
+                    if is_states and N == self._B:
+                        x = x.unsqueeze(1).repeat(1, self.horizon_len, 1) \
+                            .reshape(self._B * self.horizon_len, D)
+
+                    # [B, T, D] -> [B*S, L, D]
+                    B = self._B
+                    T = self.horizon_len
+                    assert x.shape[0] == B * T
+                    S = T // self.seq_len
+                    x = x.view(B, T, D).view(B * S, self.seq_len, D)
+                    return x.to(self.device)
+
+                if x.dim() == 3:  # [T,B,D] or [B,T,D]
+                    if x.size(0) == self.horizon_len:  # [T,B,D] -> [B,T,D]
+                        x = x.transpose(0, 1)
+                    B, T, D = x.shape
+                    assert (T % self.seq_len) == 0
+                    S = T // self.seq_len
+                    x = x.view(B, S, self.seq_len, D).reshape(B * S, self.seq_len, D)
+                    return x.to(self.device)
+
+                raise RuntimeError(f"Unexpected tensor rank {x.dim()}")
+
+            self.batch = {
+                'obs':        _reshape_to_seq(obses, is_states=False),
+                'states':     _reshape_to_seq(states, is_states=True),
+                'actions':    _reshape_to_seq(actions),
+                'returns':    _reshape_to_seq(returns),
+                'old_values': _reshape_to_seq(old_values),
+                'advantages': _reshape_to_seq(advantages),
+                'neglogpacs': _reshape_to_seq(neglogpacs) if neglogpacs is not None else None,
+                'mu':         _reshape_to_seq(mus),
+                'sigma':      _reshape_to_seq(sigmas),
+                'rnn_states': rnn_states,
+                'rnn_masks':  rnn_masks,
+            }
+
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            return self.batch
+
+        def update_values_dict(self, d):
+            """외부에서 계산된 returns/advantages/old_values/old_neg 등을 배치에 반영."""
+            if not d:
+                return
+
+            # returns
+            x = d.get('returns', None)
+            if x is not None:
+                self.batch['returns'] = x.to(self.device)
+
+            # advantages
+            x = d.get('advantages', None)
+            if x is not None:
+                self.batch['advantages'] = x.to(self.device)
+
+            # old_values (없으면 values를 대체로 사용)
+            x = d.get('old_values', d.get('values', None))
+            if x is not None:
+                self.batch['old_values'] = x.to(self.device)
+
+            # old neglogp (neglogpacs 우선, 없으면 old_neglogp)
+            x = d.get('neglogpacs', d.get('old_neglogp', None))
+            if x is not None:
+                # 이름을 맞춰 저장(아래 학습 코드가 'neglogpacs' / 'old_neglogp' 둘 다 처리)
+                self.batch['neglogpacs'] = x.to(self.device)
+
     def __init__(self, base_name, config):
         if 'name' not in config:
             config['name'] = 'ContinuousA2CBase'
@@ -862,13 +1349,20 @@ class ContinuousA2CBase(A2CBase):
         self.epoch_num = 0
 
         # 2) 논문 구조의 Actor–Critic 모델(HeightCNN→GRU→Decoder)을 생성·래핑
-        from .model_builder_dyros import ModelBuilderDyros
-        mb = ModelBuilderDyros()
-        # load() → ModelA2CContinuousLogStdDYROS 인스턴스 반환
-        paper_model = mb.load(config)
-        # build() → inner Network(nn.Module) 래퍼 반환
-        self.model = paper_model.build(config)
-
+        from .network_builder_dyros import A2CDYROSBuilder
+        from .models_dyros import ModelA2CContinuousLogStdDYROS
+        builder = A2CDYROSBuilder()
+        net = builder.load(self.config)                       # DyrosActorCritic 생성
+        wrapper = ModelA2CContinuousLogStdDYROS(net)         # RL-Games 래퍼
+        self.model = wrapper.build(self.config)               # 최종 nn.Module
+        self.model.to(self.ppo_device)
+        # ① inner DyrosActorCritic 뿐 아니라, 이 Network 래퍼 전체를 GPU 로 이동
+        self.model.to(self.ppo_device)
+        # ② GRU 파라미터 캐시 초기화
+        if hasattr(self.model, 'gru'):
+            self.model.gru.flatten_parameters()
+        if hasattr(self.model, 'gru'):
+            self.model.gru.flatten_parameters()
         # 3) RNN 사용 여부 플래그
         self.is_rnn = getattr(self.model, 'is_rnn', False)
         self.is_discrete = False
@@ -883,6 +1377,22 @@ class ContinuousA2CBase(A2CBase):
         self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
         # GENE: for wandb
         self.init_wandb = False
+
+        # --- Optimizer 생성 (공용 1개) ---
+        lr = self.config['learning_rate']
+        wd = getattr(self, 'weight_decay', 0.0)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd, eps=1e-5)
+
+        # --- separate_opt 호환: actor/critic 옵티마이저가 필요하면 같은 객체를 참조 ---
+        if getattr(self, 'sep_op', False):
+            self.optimizer_actor  = self.optimizer
+            self.optimizer_critic = self.optimizer
+        
+        self.last_lr       = float(getattr(self, 'last_lr', lr))          # 전체/critic용으로 쓰던 값
+        self.last_lr_mu    = float(getattr(self, 'last_lr_mu', lr))       # actor(μ) lr
+        self.last_lr_sigma = float(getattr(self, 'last_lr_sigma', lr))    # actor(σ) lr (쓰지 않더라도 존재시켜 둠)
+        self.lr_mul        = float(getattr(self, 'lr_mul', 1.0))          # lr multiplier 로깅용
+        self.curr_clip_frac = float(getattr(self, 'curr_clip_frac', 0.0)) # PPO clip frac 로깅용
 
    
     def preprocess_actions(self, actions):
@@ -946,6 +1456,7 @@ class ContinuousA2CBase(A2CBase):
             for i in range(len(self.dataset)):
                 if self.ppo:
                     a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss, clip_frac = self.train_actor_critic(self.dataset[i])
+                    lr_mul = 1.0 # PPO에서는 lr_mul이 항상 1.0
                     clip_fracs.append(clip_frac)
                 else:
                     a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
@@ -955,8 +1466,9 @@ class ContinuousA2CBase(A2CBase):
                 entropies.append(entropy)
                 if self.bounds_loss_coef is not None:
                     b_losses.append(b_loss)
-
-                self.dataset.update_mu_sigma(cmu, csigma)   
+                #little update
+                if hasattr(self.dataset, "update_mu_sigma"):
+                    self.dataset.update_mu_sigma(cmu, csigma) 
 
                 if self.schedule_type == 'legacy':  
                     if self.multi_gpu:
@@ -992,54 +1504,108 @@ class ContinuousA2CBase(A2CBase):
             return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
 
     def prepare_dataset(self, batch_dict):
-        obses = batch_dict['obses']
-        returns = batch_dict['returns']
-        dones = batch_dict['dones']
-        values = batch_dict['values']
-        actions = batch_dict['actions']
-        neglogpacs = batch_dict['neglogpacs']
-        mus = batch_dict['mus']
-        sigmas = batch_dict['sigmas']
-        rnn_states = batch_dict.get('rnn_states', None)
-        rnn_masks = batch_dict.get('rnn_masks', None)
+        """
+        play_steps_rnn()가 반환한 batch_dict로 학습용 데이터셋(self.dataset)을 생성/갱신.
+        - privileged 'states'는 batch_dict → vec_env → last_priv_states 순서로 확보
+        - values/returns 정규화(옵션), advantages 계산
+        - Dataset 없으면 생성, 있으면 update_values_dict로 갱신
+        """
+        # ---------- 1) 텐서 꺼내기 ----------
+        obses       = batch_dict['obses']          # [N,obs] 또는 [N,1,obs]
+        returns     = batch_dict['returns']        # [N,1]  (play_steps_rnn에서 보장)
+        values      = batch_dict['values']         # [N,1]
+        actions     = batch_dict['actions']        # [N,act]
+        mus         = batch_dict['mus']            # [N,act]
+        sigmas      = batch_dict['sigmas']         # [N,act]
+        neglogpacs  = batch_dict.get('neglogpacs', None)
+        rnn_states  = batch_dict.get('rnn_states', None)
+        rnn_masks   = batch_dict.get('rnn_masks', None)
 
+        # ---------- 2) privileged states 확보(반드시 존재) ----------
+        def _find_priv_from_anywhere_for_dataset():
+            # 0) batch_dict에 이미 담겨 있으면 그대로 사용
+            s = batch_dict.get('states', None)
+            if s is not None:
+                return s
+
+            # 1) vec_env 트리 전체를 너비우선으로 훑는다
+            roots = []
+            ve = getattr(self, 'vec_env', None)
+            roots.append(ve)
+            i = 0
+            while i < len(roots):
+                r = roots[i]; i += 1
+                if r is None: 
+                    continue
+                # 가장 확실한 경로: task.states_buf
+                if hasattr(r, 'task') and hasattr(r.task, 'states_buf'):
+                    return r.task.states_buf
+                if hasattr(r, 'states_buf'):
+                    return r.states_buf
+                # get_privileged_obs가 있더라도 내부에서 AttributeError를 낼 수 있으므로 try로 감싼다
+                if hasattr(r, 'get_privileged_obs'):
+                    try:
+                        p = r.get_privileged_obs()
+                        if p is not None:
+                            return p
+                    except Exception:
+                        pass
+                # 더 깊은 래퍼 후보들을 큐에 추가
+                for k in ('env', 'vec_env', 'venv', 'unwrapped'):
+                    roots.append(getattr(r, k, None))
+
+            # 2) 수집 루프에서 캐시해둔 값이 있으면 사용
+            return getattr(self, 'last_priv_states', None)
+
+        states = _find_priv_from_anywhere_for_dataset()
+        if states is None:
+            raise KeyError("prepare_dataset(): privileged 'states'를 가져올 수 없습니다.")
+
+        # ---------- 3) advantages / 값 정규화 ----------
         advantages = returns - values
-
         if self.normalize_value:
-            values = self.value_mean_std(values)
-            returns = self.value_mean_std(returns)
+            values_n  = self.value_mean_std(values)
+            returns_n = self.value_mean_std(returns)
+        else:
+            values_n, returns_n = values, returns
 
-        advantages = torch.sum(advantages, axis=1)
+        # ---------- 4) Dataset 생성/갱신 ----------
+        if not hasattr(self, 'dataset') or (self.dataset is None):
+            # 폴백 원배치 데이터셋 생성 (_OneBatchDataset는 ContinuousA2CBase 내부 클래스)
+            self.dataset = self._OneBatchDataset(
+                device=self.ppo_device,
+                horizon_len=self.horizon_length,
+                seq_len=self.seq_len,
+                obses=obses, states=states, actions=actions,
+                returns=returns_n, old_values=values_n, advantages=advantages,
+                neglogpacs=neglogpacs, mus=mus, sigmas=sigmas,
+                rnn_states=rnn_states, rnn_masks=rnn_masks
+            )
+        else:
+            # 값들만 갱신
+            self.dataset.update_values_dict({
+                'old_values': values_n,
+                'advantages': advantages,
+                'returns':    returns_n,
+                'actions':    actions,
+                'obs':        obses,
+                'rnn_states': rnn_states,
+                'rnn_masks':  rnn_masks,
+                'mu':         mus,
+                'sigma':      sigmas,
+            })
 
-        if self.normalize_advantage:
-            if self.is_rnn:
-                advantages = torch_ext.normalization_with_masks(advantages, rnn_masks)
-            else:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        dataset_dict = {}
-        dataset_dict['old_values'] = values
-        dataset_dict['old_logp_actions'] = neglogpacs
-        dataset_dict['advantages'] = advantages
-        dataset_dict['returns'] = returns
-        dataset_dict['actions'] = actions
-        dataset_dict['obs'] = obses
-        dataset_dict['rnn_states'] = rnn_states
-        dataset_dict['rnn_masks'] = rnn_masks
-        dataset_dict['mu'] = mus
-        dataset_dict['sigma'] = sigmas
-
-        self.dataset.update_values_dict(dataset_dict)
-
+        # ---------- 5) 중앙가치망용 dataset 갱신(옵션) ----------
         if self.has_central_value:
-            dataset_dict = {}
-            dataset_dict['old_values'] = values
-            dataset_dict['advantages'] = advantages
-            dataset_dict['returns'] = returns
-            dataset_dict['actions'] = actions
-            dataset_dict['obs'] = batch_dict['states']
-            dataset_dict['rnn_masks'] = rnn_masks
-            self.central_value_net.update_dataset(dataset_dict)
+            cv_dict = {
+                'old_values': values_n,
+                'advantages': advantages,
+                'returns':    returns_n,
+                'actions':    actions,
+                'obs':        states,     # critic에는 privileged 입력
+                'rnn_masks':  rnn_masks,
+            }
+            self.central_value_net.update_dataset(cv_dict)
 
     def train(self):
         self.init_tensors()
@@ -1055,7 +1621,7 @@ class ContinuousA2CBase(A2CBase):
 
         while True:
             epoch_num = self.update_epoch()
-            self.model.update_action_noise((self.max_epochs-epoch_num) / self.max_epochs)
+            #self.model.update_action_noise((self.max_epochs-epoch_num) / self.max_epochs)
             if self.ppo:
                 step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, clip_fracs = self.train_epoch()
             else:
@@ -1082,7 +1648,7 @@ class ContinuousA2CBase(A2CBase):
 
                 self.write_stats(total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames)
                 if len(b_losses) > 0:
-                    self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
+                    self.writer.add_scalar('losses/denoise_loss', torch_ext.mean_list(b_losses).item(), frame)
 
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
@@ -1158,83 +1724,7 @@ class ContinuousA2CBase(A2CBase):
                     should_exit = should_exit_t.float().item()
             if should_exit:
                 return self.last_mean_rewards, epoch_num
-    '''
-    #GENE : Function for logging wandb
-    def log_wandb(
-        self,
-        frame,
-        epoch_num,
-        mean_rewards,
-        mean_lengths,
-        a_losses, 
-        b_losses,
-        c_losses,
-        entropies,
-        kls,
-        clip_fracs,
-        specific_mean_rewards,
-        reward_names
-    ):
-        if self.init_wandb is False:
-            os.environ['WANDB_API_KEY'] = ''
-            wandb.init(project=self.config['name'], tensorboard = False)
-            if(self.config['name']=='DyrosTocabiWalk'):
-                wandb.save(os.path.join(os.getcwd(), 'cfg/task/DyrosTocabiWalk.yaml'), policy="now")
-                wandb.save(os.path.join(os.getcwd(), 'cfg/train/DyrosTocabiWalkPPO.yaml'), policy="now")
-                wandb.save(os.path.join(os.getcwd(), 'tasks/dyros_tocabi_walk.py'), policy="now")
-            if(self.config['name']=='DyrosTocabiSquat'):
-                wandb.save(os.path.join(os.getcwd(), 'cfg/task/DyrosTocabiSquat.yaml'), policy="now")
-                wandb.save(os.path.join(os.getcwd(), 'cfg/train/DyrosTocabiSquatPPO.yaml'), policy="now")
-                wandb.save(os.path.join(os.getcwd(), 'tasks/dyros_tocabi_squat.py'), policy="now")
-            if(self.config['name']=='TocabiNewWalk'):
-                wandb.save(os.path.join(os.getcwd(), 'cfg/task/TocabiNewWalk.yaml'), policy="now")
-                wandb.save(os.path.join(os.getcwd(), 'cfg/train/TocabiNewWalkPPO.yaml'), policy="now")
-                wandb.save(os.path.join(os.getcwd(), 'tasks/tocabi_new_walk.py'), policy="now")
-            if(self.config['name']=='DyrosDynamicWalk'):
-                wandb.save(os.path.join(os.getcwd(), 'cfg/task/DyrosDynamicWalk.yaml'), policy="now")
-                wandb.save(os.path.join(os.getcwd(), 'cfg/train/DyrosDynamicWalkPPO.yaml'), policy="now")
-                wandb.save(os.path.join(os.getcwd(), 'tasks/dyros_dynamic_walk.py'), policy="now")
-            wandb.save(os.path.join(os.getcwd(), '../assets/mjcf/dyros_tocabi/xml/dyros_tocabi.xml'), policy="now")
-            wandb.save(os.path.join(os.getcwd(), 'tasks/base/vec_task.py'), policy="now")
-            self.init_wandb = True
-            self.init_wandb_time = time.time()
-        
 
-        if (epoch_num % (self.log_wandb_frequency*self.mini_epochs_num) == 0):
-            wandb_time = time.time()
-            wandb_dict = dict()
-            wandb_dict["serial_timesteps"] = epoch_num * self.horizon_length
-            wandb_dict["n_updates"] = epoch_num
-            wandb_dict["total_timesteps"] = frame
-            wandb_dict["fps"] = int(self.frame / (wandb_time - self.init_wandb_time)) 
-            wandb_dict['ep_reward_mean'] = mean_rewards.item()
-            wandb_dict["ep_len_mean"] = mean_lengths.item()
-
-            for i in range(self.num_rewards):
-            
-                wandb_dict["rollout/"+reward_names[i]] = specific_mean_rewards[i].item()
-            #################
-            wandb_dict["time_elapsed"] = int(wandb_time - self.init_wandb_time)
-            wandb_dict["train/entropy_loss"] = torch_ext.mean_list(entropies).item()
-            wandb_dict["train/policy_gradient_loss"] = torch_ext.mean_list(a_losses).item() #GENE:actor Loss
-            wandb_dict["train/value_loss"] = torch_ext.mean_list(c_losses).item() #GENE: Critic Loss
-            wandb_dict["train/kl"] = torch_ext.mean_list(kls).item()
-            wandb_dict["train/clip_fracs"] = torch_ext.mean_list(clip_fracs).item()
-            losses = []
-            for i in range(len(a_losses)):
-                losses.append(a_losses[i] + 0.5 * c_losses[i] * self.critic_coef- entropies[i] * self.entropy_coef\
-                + b_losses[i] * self.bounds_loss_coef)
-            wandb_dict["train/loss"] = torch_ext.mean_list(losses).item() #GENE: Total Loss
-            #wandb_dict["train/explained_variance"] =  
-            #wandb.log(wandb_dict)
-            ##########################################
-            for i, nm in enumerate(self.reward_names):
-                wandb_dict[f"reward/{nm}"] = specific_mean_rewards[i].item()
-            wandb.log({
-                'loss': loss,
-                'global_step': frame  # step 정보는 이 필드로 남김
-            })
-'''
     def log_wandb(
         self,
         frame,
@@ -1311,7 +1801,7 @@ class ContinuousA2CBase(A2CBase):
                     a_losses[i]
                     + 0.5 * c_losses[i] * self.critic_coef
                     - entropies[i] * self.entropy_coef
-                    + b_losses[i] * self.bounds_loss_coef
+                    + b_losses[i]*self.config['reg_loss_coef']
                 )
             wandb_dict["train/loss"] = torch_ext.mean_list(losses).item()
 

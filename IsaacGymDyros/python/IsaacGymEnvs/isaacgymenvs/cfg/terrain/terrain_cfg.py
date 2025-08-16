@@ -18,4 +18,4 @@ class TerrainCfg():
     # terrain types: [smooth slope, rough slope, stairs up, stairs down, discrete]
     terrain_proportions = [0.1, 0.1, 0.35, 0.25, 0.2]
     # trimesh only:
-    slope_treshold = 0.75 # slopes above this threshold will be corrected to vertical surfaces
+    slope_treshold = 0.4 #0.75 # slopes above this threshold will be corrected to vertical surfaces

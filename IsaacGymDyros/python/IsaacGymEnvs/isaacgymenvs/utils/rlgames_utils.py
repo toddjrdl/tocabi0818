@@ -99,59 +99,69 @@ def get_rlgames_env_creator(
 
 
 class RLGPUAlgoObserver(AlgoObserver):
-    """Allows us to log stats from the env along with the algorithm running stats. """
+    """Allows us to log stats from the env along with the algorithm running stats."""
 
     def __init__(self):
-        pass
+        self.algo = None
+        self.writer = None
+        self.ep_infos = []       # ← 핵심: 리스트로 미리 생성
+        self.direct_info = {}
+        self.mean_scores = None  # after_init에서 실제 객체로 바꿈
 
     def after_init(self, algo):
         self.algo = algo
         self.mean_scores = torch_ext.AverageMeter(1, self.algo.games_to_track).to(self.algo.ppo_device)
-        self.ep_infos = []
-        self.direct_info = {}
         self.writer = self.algo.writer
+
+        if not isinstance(self.ep_infos, list):
+            self.ep_infos = []
+        self.direct_info = {}
 
     def process_infos(self, infos, done_indices):
         assert isinstance(infos, dict), "RLGPUAlgoObserver expects dict info"
-        if isinstance(infos, dict):
-            if 'episode' in infos:
-                self.ep_infos.append(infos['episode'])
 
-            if len(infos) > 0 and isinstance(infos, dict):  # allow direct logging from env
-                self.direct_info = {}
-                for k, v in infos.items():
-                    # only log scalars
-                    if isinstance(v, float) or isinstance(v, int) or (isinstance(v, torch.Tensor) and len(v.shape) == 0):
-                        self.direct_info[k] = v
+        if 'episode' in infos and isinstance(infos['episode'], dict):
+            self.ep_infos.append(infos['episode'])
+
+        self.direct_info = {}
+        for k, v in infos.items():
+            if isinstance(v, (float, int)):
+                self.direct_info[k] = float(v)
+            elif isinstance(v, torch.Tensor) and v.dim() == 0:
+                self.direct_info[k] = float(v.item())
 
     def after_clear_stats(self):
-        self.mean_scores.clear()
+        if self.mean_scores is not None:
+            self.mean_scores.clear()
 
     def after_print_stats(self, frame, epoch_num, total_time):
         if self.ep_infos:
-            for key in self.ep_infos[0]:
-                    infotensor = torch.tensor([], device=self.algo.device)
-                    for ep_info in self.ep_infos:
-                        # handle scalar and zero dimensional tensor infos
-                        if not isinstance(ep_info[key], torch.Tensor):
-                            ep_info[key] = torch.Tensor([ep_info[key]])
-                        if len(ep_info[key].shape) == 0:
-                            ep_info[key] = ep_info[key].unsqueeze(0)
-                        infotensor = torch.cat((infotensor, ep_info[key].to(self.algo.device)))
-                    value = torch.mean(infotensor)
-                    self.writer.add_scalar('Episode/' + key, value, epoch_num)
+            keys = list(self.ep_infos[0].keys())
+            for key in keys:
+                vals = []
+                for ep in self.ep_infos:
+                    x = ep.get(key)
+                    if isinstance(x, torch.Tensor):
+                        x = x if x.dim() == 0 else x.mean()
+                        vals.append(x.to(self.algo.device).float())
+                    elif isinstance(x, (float, int)):
+                        vals.append(torch.tensor(float(x), device=self.algo.device))
+                if len(vals) > 0:
+                    value = torch.stack(vals).mean()
+                    self.writer.add_scalar(f'Episode/{key}', value.item(), epoch_num)
             self.ep_infos.clear()
-        
+
         for k, v in self.direct_info.items():
             self.writer.add_scalar(f'{k}/frame', v, frame)
             self.writer.add_scalar(f'{k}/iter', v, epoch_num)
             self.writer.add_scalar(f'{k}/time', v, total_time)
 
-        if self.mean_scores.current_size > 0:
-            mean_scores = self.mean_scores.get_mean()
-            self.writer.add_scalar('scores/mean', mean_scores, frame)
-            self.writer.add_scalar('scores/iter', mean_scores, epoch_num)
-            self.writer.add_scalar('scores/time', mean_scores, total_time)
+        ms = getattr(self, 'mean_scores', None)
+        if ms is not None and getattr(ms, 'current_size', 0) > 0:
+            m = ms.get_mean()
+            self.writer.add_scalar('scores/mean', m, frame)
+            self.writer.add_scalar('scores/iter', m, epoch_num)
+            self.writer.add_scalar('scores/time', m, total_time)
 
 class MultiObserver(AlgoObserver):
     """Meta-observer that allows the user to add several observers."""
@@ -213,3 +223,28 @@ class RLGPUEnv(vecenv.IVecEnv):
             print(info['action_space'], info['observation_space'])
 
         return info
+
+    def get_privileged_obs(self):
+        """
+        래퍼 깊이에 상관없이 task.states_buf를 최대한 찾아서 반환.
+        없으면 None.
+        """
+        # 직접 보유
+        if hasattr(self, 'task') and hasattr(self.task, 'states_buf'):
+            return self.task.states_buf
+        if hasattr(self, 'states_buf'):
+            return self.states_buf
+
+        # 한 단계 아래 래퍼
+        e = getattr(self, 'env', None)
+        if e is not None:
+            if hasattr(e, 'task') and hasattr(e.task, 'states_buf'):
+                return e.task.states_buf
+            if hasattr(e, 'states_buf'):
+                return e.states_buf
+            if hasattr(e, 'get_privileged_obs'):
+                try:
+                    return e.get_privileged_obs()
+                except Exception:
+                    pass
+        return None
