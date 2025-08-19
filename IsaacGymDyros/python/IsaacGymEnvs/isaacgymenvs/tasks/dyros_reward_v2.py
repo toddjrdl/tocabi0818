@@ -95,7 +95,7 @@ def compute_humanoid_walk_reward_v2(
     r_contact = (r_force > 30.0).float()
 
     # scaled & clipped
-    scale_F = 0.5 * total_mass.squeeze(-1) * 9.81  # per env
+    scale_F = total_mass.squeeze(-1) * 9.81  # per env
     l_scaled = torch.clamp(l_force / scale_F, 0.0, 1.0)
     r_scaled = torch.clamp(r_force / scale_F, 0.0, 1.0)
 
@@ -132,7 +132,9 @@ def compute_humanoid_walk_reward_v2(
     # 4) regularizers
     # ------------------------------------------------------------ #
     # default joint pose
-    r_joint_def = _phi(joint_position_states, 2.0)  # DWL: θ₀ = 0 rad
+    upper_joints = joint_position_states[:, 12:]
+    r_joint_def = _phi(upper_joints, 1.0)  # 약한 제약
+    #r_joint_def = _phi(joint_position_states, 2.0)  # DWL: θ₀ = 0 rad
 
     # energy ≈ |a| surrogate
     tau   = actions
@@ -147,7 +149,12 @@ def compute_humanoid_walk_reward_v2(
     r_smooth = torch.sum(a_diff * a_diff, dim=1) / dof
 
     # large contact clip penalty
-    r_big_clip = torch.clamp(l_scaled + r_scaled - 2.0, 0.0)
+    #r_big_clip = torch.clamp(l_scaled + r_scaled - 2.0, 0.0)
+
+    clip_threshold = mass_per_env * 9.81 * 1.1  # 체중의 110%
+    l_clip = torch.clamp(l_force - clip_threshold, 0.0, clip_threshold * 0.25)
+    r_clip = torch.clamp(r_force - clip_threshold, 0.0, clip_threshold * 0.25)
+    r_big_clip = (l_clip + r_clip) / (clip_threshold + 1e-6)
 
     # ------------------------------------------------------------ #
     # stack & weight (Table V)
@@ -171,7 +178,7 @@ def compute_humanoid_walk_reward_v2(
         1.0, 1.0, 1.0, 0.5,      # velocity / orient / height
         1.0, 1.0,                # periodic
         1.0, 0.5,                # foot traj
-        0.2, -0.0001, -0.01, -0.01  # regularizers
+        0.2, -0.00025, -0.01, -0.01  # regularizers
     ], device=root_states.device).unsqueeze(0)
 
     total_reward = torch.sum(rewards * μ, dim=1)
