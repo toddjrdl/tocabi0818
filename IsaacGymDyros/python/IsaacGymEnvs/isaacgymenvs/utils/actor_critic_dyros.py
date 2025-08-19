@@ -85,15 +85,28 @@ class DyrosActorCritic(nn.Module):
         # 3) cuDNN 파라미터 캐시 초기화
         self.gru.flatten_parameters()
 
-        # 4) hidden 배치 크기 확장 (1 → B)
-        if hid_in is not None and hid_in.size(1) == 1:
-            hid_in = hid_in.expand(-1, obs_seq.size(0), -1).contiguous()
+        # 4) hidden 배치 크기 확장 (1 → B) - 수정된 부분
+        if hid_in is not None:
+            if hid_in.size(1) == 1 and hid_in.size(1) != obs_seq.size(0):
+                hid_in = hid_in.expand(-1, obs_seq.size(0), -1).contiguous()
+        else:
+            # hidden이 None이면 기본값 생성
+            num_layers = self.gru.num_layers
+            hidden_size = self.gru.hidden_size
+            hid_in = torch.zeros(num_layers, obs_seq.size(0), hidden_size, 
+                                device=device, dtype=obs_seq.dtype)
 
         # 5) GRU 인코딩
-        from torch.backends import cudnn
-        with cudnn.flags(enabled=False):
+        #from torch.backends import cudnn
+        #with cudnn.flags(enabled=False):
             # 반드시 hid_in 을 넘겨야 올바른 hidden state 사용
+        #    gru_out, h_new = self.gru(obs_seq, hid_in)
+        try:
             gru_out, h_new = self.gru(obs_seq, hid_in)
+        except RuntimeError as e:
+            print(f"GRU forward error: {e}")
+            print(f"obs_seq shape: {obs_seq.shape}, hid_in shape: {hid_in.shape if hid_in is not None else None}")
+            raise
 
         # 6) 마지막 타임스텝만 꺼내 z 생성
         h_t = gru_out[:, -1]                             # (B,256)
@@ -105,6 +118,13 @@ class DyrosActorCritic(nn.Module):
 
         # 8) Decoder
         recon = self.decoder(z)                          # (B, priv_dim)
+  
+        target_priv = priv_seq[:, -1]  # 마지막 시점의 privileged state
+        if recon.shape[1] != target_priv.shape[1]:
+            print(f"Warning: Decoder output size {recon.shape[1]} != target size {target_priv.shape[1]}")
+            # 크기를 맞추기 위해 잘라내거나 패딩
+            min_dim = min(recon.shape[1], target_priv.shape[1])
+            recon = recon[:, :min_dim]
 
         # 9) Critic head (privileged state 마지막 시점)
         value = self.value_net(priv_seq[:, -1])          # (B,1)

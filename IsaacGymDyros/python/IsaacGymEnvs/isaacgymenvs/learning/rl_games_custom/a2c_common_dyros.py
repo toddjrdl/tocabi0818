@@ -704,12 +704,43 @@ class A2CBase:
         policy_loss, value_loss, entropy, kl, neglogp = self._compute_ppo_losses(res, obs_dict)
 
         # 5) Denoising loss (decoder 출력 vs. 마지막 privileged state)
+        #if recon is not None:
+        #    denoise_loss = F.mse_loss(recon, obs_dict['states'][:, -1, :])
+        #else:
+        #    # 모델이 아직 'recon'을 안 돌려주면 denoise는 0으로(학습 진행)
+        #    denoise_loss = value.detach().sum() * 0.0
+        denoise_loss = torch.tensor(0.0, device=self.device)
         if recon is not None:
-            denoise_loss = F.mse_loss(recon, obs_dict['states'][:, -1, :])
-        else:
-            # 모델이 아직 'recon'을 안 돌려주면 denoise는 0으로(학습 진행)
-            denoise_loss = value.detach().sum() * 0.0
-
+            # Target: 마지막 시점의 privileged state
+            target_priv = priv_seq[:, -1]  # (B, priv_dim)
+            
+            # recon과 target의 크기를 맞춤
+            if recon.shape[1] != target_priv.shape[1]:
+                min_dim = min(recon.shape[1], target_priv.shape[1])
+                recon_truncated = recon[:, :min_dim]
+                target_truncated = target_priv[:, :min_dim]
+            else:
+                recon_truncated = recon
+                target_truncated = target_priv
+            
+            # L2 reconstruction loss + L1 regularization on latent z
+            mse_loss = F.mse_loss(recon_truncated, target_truncated)
+            
+            # L1 regularization on latent representation z (if available)
+            l1_reg = torch.tensor(0.0, device=self.device)
+            if 'latent_z' in res:
+                z = res['latent_z']
+                l1_reg = torch.mean(torch.abs(z))
+            
+            # reg_loss_coef from config (논문에서 λr = 0.002)
+            reg_coef = self.config.get('reg_loss_coef', 0.002)
+            denoise_loss = mse_loss + reg_coef * l1_reg
+            
+            # 디버깅 정보
+            if self.frame % 1000 == 0:
+                print(f"Denoise Loss - MSE: {mse_loss.item():.4f}, L1_reg: {l1_reg.item():.4f}, Total: {denoise_loss.item():.4f}")
+                print(f"Recon shape: {recon_truncated.shape}, Target shape: {target_truncated.shape}")
+        
         # 6) 전체 손실: λᵣ·L_den + L_π + λᵥ·Lᵥ
         λr = self.config['reg_loss_coef']
         λπ = self.config.get('policy_coef', 5.0) # 논문 값
