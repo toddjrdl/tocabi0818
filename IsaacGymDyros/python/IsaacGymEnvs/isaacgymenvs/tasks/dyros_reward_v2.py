@@ -151,9 +151,14 @@ def compute_humanoid_walk_reward_v2(
     # large contact clip penalty
     #r_big_clip = torch.clamp(l_scaled + r_scaled - 2.0, 0.0)
 
-    clip_threshold = mass_per_env * 9.81 * 1.1  # 체중의 110%
-    l_clip = torch.clamp(l_force - clip_threshold, 0.0, clip_threshold * 0.25)
-    r_clip = torch.clamp(r_force - clip_threshold, 0.0, clip_threshold * 0.25)
+    # large contact clip penalty
+    clip_threshold = mass * 9.81 * 1.1  # 체중의 110%
+
+    l_excess = torch.clamp(l_force - clip_threshold, min=0.0)
+    r_excess = torch.clamp(r_force - clip_threshold, min=0.0)
+
+    l_clip = torch.clamp(l_excess, max=clip_threshold * 0.25)
+    r_clip = torch.clamp(r_excess, max=clip_threshold * 0.25)
     r_big_clip = (l_clip + r_clip) / (clip_threshold + 1e-6)
 
     # ------------------------------------------------------------ #
