@@ -597,56 +597,108 @@ class DyrosDynamicWalk(VecTask):
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
-        # self.gym.refresh_force_sensor_tensor(self.sim)
+        
         ################################################################
-        # 1) 기존 37-dim proprio
-        self.compute_humanoid_walk_observations()        # ← 내부에서 self.obs_history 채움
-        o_prop = self.obs_buf[:, -37:]                   # (B,37)
-        # 2) Last actions 12차원 (보조 액션 제외)
+        # 126차원 observation을 직접 구성 (compute_humanoid_walk_observations 대신)
+        
+        pi = 3.14159265358979
+        
+        # 1) Orientation (3차원) - Euler angles
+        q = self.root_states[:,3:7].clone()
+        fixed_angle_x, fixed_angle_y, fixed_angle_z = quat2euler(q)
+        fixed_angle_x += self.quat_bias[:,0]
+        fixed_angle_y += self.quat_bias[:,1]
+        fixed_angle_z += self.quat_bias[:,2]
+        
+        # 2) Joint positions & velocities (24차원)
+        qpos = self.qpos_noise[:,0:12] + self.qpos_bias  # 12차원
+        qvel = self.qvel_noise[:,0:12]                   # 12차원
+        
+        # 3) Phase information (2차원)
+        time2idx = (self.time % self.mocap_cycle_period) / self.mocap_cycle_dt
+        phase = (self.init_mocap_data_idx + time2idx) % self.mocap_data_num / self.mocap_data_num
+        sin_phase = torch.sin(2*pi*phase) 
+        cos_phase = torch.cos(2*pi*phase)
+        
+        # 4) Target velocities (2차원)
+        target_vel_x = self.target_vel[:,0].unsqueeze(-1)
+        target_vel_y = self.target_vel[:,1].unsqueeze(-1)
+        
+        # 5) Root velocities with noise (6차원)
+        vel_noise = torch.rand(self.num_envs, 6, device=self.device, dtype=torch.float)*0.05-0.025
+        root_vel = self.root_states[:,7:] + vel_noise
+        
+        # 6) Last actions (12차원) - 보조 액션 제외
         last_actions = self.actions[:, :-1] if hasattr(self, 'actions') and self.actions.size(1) > 12 else torch.zeros(self.num_envs, 12, device=self.device)
-        # 3) Raw height-map 77차원
-        h_raw = self.get_height_samples()  # (B,77
-        # 4) 전체 observation: 37 + 12 + 77 = 126차원
-        full_obs = torch.cat([o_prop, last_actions, h_raw], dim=1)
-        # obs_buf 크기 조정
-        if self.obs_buf.size(1) < full_obs.size(1):
-            self.obs_buf = torch.zeros((self.num_envs, full_obs.size(1)), device=self.device, dtype=torch.float32)
-        self.obs_buf[:, -full_obs.size(1):] = full_obs
+        
+        # 7) Height scan (77차원)
+        h_raw = self.get_height_samples()  # (B, 77)
+        
+        # ★ 126차원 observation 구성: 3+12+12+2+2+6+12+77 = 126
+        obs_126 = torch.cat([
+            fixed_angle_x.unsqueeze(-1),     # 1
+            fixed_angle_y.unsqueeze(-1),     # 1  
+            fixed_angle_z.unsqueeze(-1),     # 1 → 3차원 orientation
+            qpos,                            # 12차원 joint pos
+            qvel,                            # 12차원 joint vel
+            sin_phase.view(-1,1),            # 1
+            cos_phase.view(-1,1),            # 1 → 2차원 phase
+            target_vel_x,                    # 1
+            target_vel_y,                    # 1 → 2차원 target vel
+            root_vel,                        # 6차원 root vel
+            last_actions,                    # 12차원 last actions
+            h_raw                            # 77차원 height scan
+        ], dim=-1)
+        
+        # Normalization (기존 방식 유지)
+        diff = obs_126 - self.obs_mean
+        normed_obs_126 = diff / torch.sqrt(self.obs_var + 1e-8*torch.ones_like(self.obs_var))
+        
+        # ★ obs_buf에 126차원 전체 할당
+        self.obs_buf[:] = normed_obs_126
+        
+        # 37차원 proprio만 obs_history에 저장 (기존 로직 유지)
+        proprio_37 = torch.cat([
+            fixed_angle_x.unsqueeze(-1),
+            fixed_angle_y.unsqueeze(-1), 
+            fixed_angle_z.unsqueeze(-1),
+            qpos, qvel, sin_phase.view(-1,1), cos_phase.view(-1,1),
+            target_vel_x, target_vel_y, root_vel
+        ], dim=-1)  # 3+12+12+2+2+6 = 37차원
+        
+        # History update (37차원만)
+        obs_dim = proprio_37.size(1)  # 37
+        self.obs_history = torch.cat((self.obs_history[:, obs_dim:], proprio_37), dim=-1)
+        
+        epi_start_idx = (self.epi_len == 0)
+        total_slices = self.num_obs_his * self.num_obs_skip
+        for i in range(total_slices):
+            start = obs_dim * i
+            end   = obs_dim * (i + 1)
+            self.obs_history[epi_start_idx, start:end] = proprio_37[epi_start_idx]
 
-        # 5) Privileged state: 126 + 6 + 6 + 6 = 144차원 (heightmap 중복 없음)
+        ################################################################
+        # Privileged state: 126 + 6 + 6 + 6 = 144차원
         foot_pos = self.body_states[:, [self.left_foot_idx, self.right_foot_idx], 0:3].flatten(1)  # 6차원
         foot_vel = self.body_states[:, [self.left_foot_idx, self.right_foot_idx], 7:10].flatten(1)  # 6차원
         
-        # Contact forces 간략화: 왼발, 오른발만 (6차원)
+        # Contact forces (6차원)
         left_foot_contact = self.contact_forces[:, self.left_foot_idx, :3]   # (B,3)
         right_foot_contact = self.contact_forces[:, self.right_foot_idx, :3] # (B,3)
-        cf_simplified = torch.cat([left_foot_contact, right_foot_contact], dim=1)  # (B,6)
-
-        # Privileged state: observation(126) + foot_pos(6) + foot_vel(6) + cf_simplified(6) = 144차원
-        priv_vec = torch.cat([full_obs, foot_pos, foot_vel, cf_simplified], dim=1)
+        contact_forces = torch.cat([left_foot_contact, right_foot_contact], dim=1)  # (B,6)
+        
+        # Privileged state 구성
+        priv_vec = torch.cat([
+            normed_obs_126,     # 126차원 (observation)
+            foot_pos,           # 6차원
+            foot_vel,           # 6차원  
+            contact_forces      # 6차원
+        ], dim=1)              # 총 144차원
         
         # Dynamic privileged state buffer allocation
         if self.states_buf.shape[1] != priv_vec.shape[1]:
             self.states_buf = torch.zeros((self.num_envs, priv_vec.shape[1]), device=self.device, dtype=torch.float32)
             self.cfg["env"]["numStates"] = int(priv_vec.shape[1])
-        
-        self.states_buf[:] = priv_vec
-
-            # ============== 디버깅 추가 (3줄만) ==============
-        if self.progress_buf[0] % 1000 == 0:  # 1000 스텝마다
-            print(f"[DEBUG] contact_forces shape: {self.contact_forces.shape}")
-            print(f"[DEBUG] cf_flat shape: {cf_flat.shape}, priv_vec shape: {priv_vec.shape}")
-        
-    # ===============================================
-        
-        assert priv_vec.shape[1] > 0, \
-            f"priv_vec is empty: shapes -> o={o_prop.shape}, pos={foot_pos.shape}, vel={foot_vel.shape}, cf={cf_flat.shape}, h={h_emb.shape}"
-
-        # (선택) 만약 states_buf의 크기 계산을 나중에 바꿨다면 여기도 자동 동기화
-        if self.states_buf.shape[1] != priv_vec.shape[1]:
-            # 환경 생성 시 계산한 priv_dim과 실제 합산치가 다르면 재할당
-            self.states_buf = torch.zeros((self.num_envs, priv_vec.shape[1]), device=self.device, dtype=torch.float32)
-            self.cfg["env"]["numStates"] = int(priv_vec.shape[1])        
         
         self.states_buf[:] = priv_vec
         ################################################################
