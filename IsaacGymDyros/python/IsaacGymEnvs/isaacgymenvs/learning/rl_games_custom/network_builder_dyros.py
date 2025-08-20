@@ -26,11 +26,11 @@ class A2CDYROSBuilder(NetworkBuilder):
             env_cfg   = kwargs.get('env', {})
             model_cfg = kwargs.get('model', {})
 
-            num_obs  = kwargs.get('input_shape', (env_cfg.get('NumSingleStepObs'),))[0]
-            priv_dim = kwargs.get('priv_dim', env_cfg.get('priv_dim', 187))
+            num_obs  = kwargs.get('input_shape', (env_cfg.get('NumSingleStepObs',126),))[0]
+            priv_dim = kwargs.get('priv_dim', env_cfg.get('priv_dim', 144))
             act_dim  = kwargs.get('actions_num', env_cfg.get('NumAction'))
             rnn_hid  = kwargs.get('rnn_hidden', model_cfg.get('rnn_hidden', 256))
-            zdim     = kwargs.get('z_dim', model_cfg.get('latent_dim', 24))
+            zdim     = kwargs.get('z_dim', model_cfg.get('latent_dim', 32))
 
             return DyrosActorCritic(
                 num_obs     = num_obs,

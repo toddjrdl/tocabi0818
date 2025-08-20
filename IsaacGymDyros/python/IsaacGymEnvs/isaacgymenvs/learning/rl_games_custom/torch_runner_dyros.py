@@ -97,10 +97,10 @@ class RunnerDyros:
 
         # === 관측/행동/priv 차원 확정 ===
         # 관측은 환경이 이미 height 임베딩을 합쳐 넣은 '최종' 차원을 그대로 사용
-        obs_dim  = int(env_cfg.get('numObservations', env_cfg.get('NumSingleStepObs', 61)))
+        obs_dim  = int(env_cfg.get('numObservations', env_cfg.get('NumSingleStepObs', 126)))
         act_dim  = int(env_cfg.get('NumAction', env_cfg.get('numActions', 13)))
         # priv_dim은 환경에서 계산한 최종 길이가 있으면 우선 사용
-        priv_dim = int(env_cfg.get('numStates', env_cfg.get('priv_dim', 187)))
+        priv_dim = int(env_cfg.get('numStates', env_cfg.get('priv_dim', 144)))
 
         self.config['input_shape'] = (obs_dim,)
         self.config['actions_num'] = act_dim
@@ -109,7 +109,7 @@ class RunnerDyros:
 
         # ─── 4) 네트워크 차원 ───────────────────────────────
         self.config['rnn_hidden'] = int(mdl.get('rnn_hidden', 256))
-        self.config['z_dim']      = int(mdl.get('latent_dim', 24))
+        self.config['z_dim']      = int(mdl.get('latent_dim', 32))
 
         # ─── 5) 나머지 블록 병합 ───────────────────────────
         self.config['algo']    = self.algo_params

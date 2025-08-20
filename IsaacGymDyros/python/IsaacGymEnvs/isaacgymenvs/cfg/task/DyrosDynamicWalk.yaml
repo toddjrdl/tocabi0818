@@ -12,11 +12,11 @@ env:
   
   clipActions: 1.0
 
-  NumSingleStepObs: 37
+  NumSingleStepObs: 126
   NumAction: 13
   #numStates: 187
   height_emb_dim: 24
-  numObservations: 61
+  numObservations: 126
   reward_version: v2 # v1: old reward, v2: new reward
 
   perturbation: False #False for default
@@ -51,7 +51,7 @@ env:
     selected:   false
     slope_treshold: 0.3
 
-  priv_dim: 187
+  priv_dim: 144
 
 sim:
   dt: 0.002 #0.0005 #0.004 # 0.0005 #1/2000 

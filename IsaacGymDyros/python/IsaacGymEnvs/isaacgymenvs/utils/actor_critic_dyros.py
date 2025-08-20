@@ -14,11 +14,11 @@ class DyrosActorCritic(nn.Module):
     """
 
     def __init__(self,
-                 num_obs: int = 61,
-                 priv_dim: int = 187,      # passed in from YAML later
+                 num_obs: int = 126,
+                 priv_dim: int = 144,      # passed in from YAML later
                  num_actions: int = 13,
                  rnn_hidden: int = 256,
-                 z_dim: int = 24):
+                 z_dim: int = 32):
         super().__init__()
         if hasattr(self, '_factory_kwargs'):
             self._factory_kwargs = {
@@ -45,6 +45,8 @@ class DyrosActorCritic(nn.Module):
             nn.ELU(inplace=True),
             nn.Linear(64, priv_dim)
         )
+        nn.init.xavier_uniform_(self.decoder[-1].weight, gain=0.5)  # 작은 gain
+        nn.init.zeros_(self.decoder[-1].bias)
         # ---------- Critic ----------
         self.value_net = nn.Sequential(
             nn.Linear(priv_dim, 512), nn.ELU(inplace=True),

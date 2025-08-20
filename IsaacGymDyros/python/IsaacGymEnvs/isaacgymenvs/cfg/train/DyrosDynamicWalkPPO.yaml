@@ -1,3 +1,5 @@
+
+# DyrosDynamicWalkPPO.yaml - 기존 설정 기반 간략화
 _defaults:
   - _self_
   - override hydra/job_logging: default
@@ -14,16 +16,14 @@ hydra:
   output_subdir: null
 
 runner:
-  save_interval: 100           # 몇 epoch마다 저장할지 (0 이면 저장 안 함)
-  save_dir: runs/${task.name}/nn # hydra.run.dir 에 상대적인 경로
-
+  save_interval: 100
+  save_dir: runs/${task.name}/nn
 
 params:
   seed: ${...seed}
 
   algo:
     name: a2c_continuous
-    #mini_epochs_num: 4
     gamma: 0.995 
 
   reward_shaper:
@@ -32,19 +32,24 @@ params:
   model:
     name: continuous_a2c_logstd_dyros
     rnn_hidden: 256
-    latent_dim: 24
-    reg_loss_coef: 0.002
+    latent_dim: 32               # ← 32차원으로 수정
+    reg_loss_coef: 0.002         # ← DWL 논문값으로 수정
 
   network:
     name: dyros_actor_critic
     separate: False
-
+    params:
+      input_shape: [126]         # ← 126차원으로 수정
+      priv_dim: 144             # ← 144차원으로 수정  
+      actions_num: 13
+      z_dim: 32                 # ← 32차원으로 수정
+      
     rnn:
       name: gru
       units: 256
       layers: 1
-      before_mlp: false
-      concat_input: true
+      before_mlp: false         # ← 기존값 유지
+      concat_input: true        # ← 기존값 유지
 
     space:
       continuous:
@@ -54,12 +59,11 @@ params:
           name: default
         sigma_init:
           name: const_initializer
-          val: -2.302585 # -2.9957 -> 1n(1/20)
+          val: -2.302585          # ← 기존값 유지 (ln(1/10))
         sigma_last:
           name: const_initializer
-          val: -2.9957
-        fixed_sigma: False
-
+          val: -2.9957            # ← 기존값 유지 (ln(1/20))
+        fixed_sigma: False        # ← 기존값 유지 (learnable)
 
       initializer:
         name: orthogonal_initializer
@@ -68,77 +72,68 @@ params:
         name: None
 
     mlp:
-      units:      [512, 512, 256]
+      units: [512, 512, 256]
       activation: relu
-      d2rl:       False
-      input_num:  187
+      d2rl: False
+      input_num: 144              # ← 144로 수정 (privileged state)
 
       initializer:
         name: orthogonal_initializer
         gain: 0.01
-      regularizer:
-        name: None
 
-    estimator_mlp:
-      units:      [512, 512, 256]
-      activation: relu
-      d2rl:       False
-      input_num:  187
-
-      initializer:
-        name: orthogonal_initializer
-        gain: 0.01
-      regularizer:
-        name: None
-
-  load_checkpoint: ${if:${...checkpoint},True,False} # flag which sets whether to load the checkpoint
-  load_path: ${...checkpoint} # path to the checkpoint to load
+  load_checkpoint: ${if:${...checkpoint},True,False}
+  load_path: ${...checkpoint}
 
   env_name: rlgpu
 
   config:
     name: ${resolve_default:DyrosDynamicWalk,${....experiment}}
     full_experiment_name: ${.name}
-    #env_name: rlgpu
     multi_gpu: False
     mixed_precision: True
-    normalize_input: True #default = True
-    normalize_value: True #Need to change to False
+    normalize_input: True
+    normalize_value: True
     value_bootstrap: True
     clip_actions: True
     num_actors: ${....task.env.numEnvs}
+    
     reward_shaper:
-      scale_value: 1.0 
+      scale_value: 1.0
+      
     normalize_advantage: True 
-    gamma: 0.99
+    gamma: 0.995
     tau: 0.95
-    learning_rate: 1e-5
+    learning_rate: 1e-5           # ← 기존값 유지
     learning_rate_min: 5e-6
-    lr_schedule: linear # could be adaptive, linear, constant # DH: should be linear
+    lr_schedule: linear
     kl_threshold: 0.008
     score_to_win: 20000
-    max_epochs: ${resolve_default:20000,${....max_iterations}}   # DH: u may play with this # GENE: 80000000 / 16384 * 2
+    max_epochs: ${resolve_default:20000,${....max_iterations}}
     save_best_after: 200
     save_frequency: 100
     print_stats: True
     grad_norm: 0.5
-    entropy_coef: 0.002
+    entropy_coef: 0.005
     truncate_grads: True
     ppo: True
     use_estimator_network: False
     e_clip: 0.3
-    horizon_length: 128    # DH: u may play with this
-    minibatch_size: 4096  # DH: u may play with this (num_envs*horizon_length/mini_batch_size should be minibatch_size!!!!!!!!!!)
-    mini_epochs: 3
-    critic_coef: 5
-    policy_coef: 5
+    
+    # 중요한 하이퍼파라미터들 (기존값 유지)
+    horizon_length: 128           # ← 기존값 유지
+    minibatch_size: 4096          # ← 기존값 유지  
+    mini_epochs: 3                # ← 기존값 유지
+    seq_len: 4                    # ← 기존값 유지
+    
+    critic_coef: 5                # ← value_coef
+    policy_coef: 5                # ← DWL policy weight
     clip_value: True
-    seq_len: 4
     bounds_loss_coef: 0.
-    reg_loss_coef: 0.002
-    #wandb
-    wandb_activate: True # True, False
+    reg_loss_coef: 0.002          # ← DWL regularization (수정)
+    
+    # Logging
+    wandb_activate: True
     log_wandb_frequency: 10
-    num_rewards: 14 #Modify with individual tasks 
-    num_extra_logging: 12 #Modify with individual tasks
-    separate_opt: True #True only when trying to study with separate actor/critic
+    num_rewards: 14
+    num_extra_logging: 12
+    separate_opt: True
