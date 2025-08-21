@@ -52,12 +52,23 @@ class DyrosDynamicWalk(VecTask):
         
         # --- HeightCNN & 관측 차원 갱신 ---
         self.height_H, self.height_W = 11, 7
-        self.raw_height_dim = self.height_H * self.height_W
+        self.raw_height_dim = self.height_H * self.height_W  # 77
 
-        self.proprio_dim         = int(env_cfg["NumSingleStepObs"])           # ex) 37
-        self.num_single_step_obs = self.proprio_dim + self.raw_height_dim + 12    # ex) 61
+        self.proprio_dim = int(env_cfg["NumSingleStepObs"])  # 37
+        self.last_actions_dim = 12  # 보조 액션 제외한 12차원
+
+        # ★ 진짜 observation 차원: 37(proprio) + 12(last_actions) + 77(height) = 126
+        self.actual_obs_dim = self.proprio_dim + self.last_actions_dim + self.raw_height_dim  # 126
+
+        # ★ VecTask가 obs_buf 할당에 사용할 차원을 126으로 설정
+        env_cfg["numObservations"] = self.actual_obs_dim  # 126
+
+        # 내부적으로 사용할 single step obs (주로 히스토리 계산용) - 기존값 유지
+        self.num_single_step_obs = self.proprio_dim + self.raw_height_dim + 12  # 61 (기존 로직)
         env_cfg["NumSingleStepObs"] = self.num_single_step_obs
-        env_cfg["numObservations"]  = self.num_single_step_obs
+
+        print(f"[INFO] Setting numObservations to {self.actual_obs_dim} (126)")
+        print(f"[INFO] Internal NumSingleStepObs: {self.num_single_step_obs} (61)")
 
         # --- env 개수: 직접 대입 금지( VecTask 가 설정 ) ---
         expected_num_envs = int(env_cfg.get("numEnvs", env_cfg.get("num_envs", 4096)))
@@ -599,7 +610,7 @@ class DyrosDynamicWalk(VecTask):
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         
         ################################################################
-        # 126차원 observation을 직접 구성 (compute_humanoid_walk_observations 대신)
+        # 126차원 observation을 직접 구성
         
         pi = 3.14159265358979
         
@@ -628,36 +639,7 @@ class DyrosDynamicWalk(VecTask):
         vel_noise = torch.rand(self.num_envs, 6, device=self.device, dtype=torch.float)*0.05-0.025
         root_vel = self.root_states[:,7:] + vel_noise
         
-        # 6) Last actions (12차원) - 보조 액션 제외
-        last_actions = self.actions[:, :-1] if hasattr(self, 'actions') and self.actions.size(1) > 12 else torch.zeros(self.num_envs, 12, device=self.device)
-        
-        # 7) Height scan (77차원)
-        h_raw = self.get_height_samples()  # (B, 77)
-        
-        # ★ 126차원 observation 구성: 3+12+12+2+2+6+12+77 = 126
-        obs_126 = torch.cat([
-            fixed_angle_x.unsqueeze(-1),     # 1
-            fixed_angle_y.unsqueeze(-1),     # 1  
-            fixed_angle_z.unsqueeze(-1),     # 1 → 3차원 orientation
-            qpos,                            # 12차원 joint pos
-            qvel,                            # 12차원 joint vel
-            sin_phase.view(-1,1),            # 1
-            cos_phase.view(-1,1),            # 1 → 2차원 phase
-            target_vel_x,                    # 1
-            target_vel_y,                    # 1 → 2차원 target vel
-            root_vel,                        # 6차원 root vel
-            last_actions,                    # 12차원 last actions
-            h_raw                            # 77차원 height scan
-        ], dim=-1)
-        
-        # Normalization (기존 방식 유지)
-        diff = obs_126 - self.obs_mean
-        normed_obs_126 = diff / torch.sqrt(self.obs_var + 1e-8*torch.ones_like(self.obs_var))
-        
-        # ★ obs_buf에 126차원 전체 할당
-        self.obs_buf[:] = normed_obs_126
-        
-        # 37차원 proprio만 obs_history에 저장 (기존 로직 유지)
+        # ★ 37차원 proprio (기존 normalization 사용)
         proprio_37 = torch.cat([
             fixed_angle_x.unsqueeze(-1),
             fixed_angle_y.unsqueeze(-1), 
@@ -666,34 +648,54 @@ class DyrosDynamicWalk(VecTask):
             target_vel_x, target_vel_y, root_vel
         ], dim=-1)  # 3+12+12+2+2+6 = 37차원
         
-        # History update (37차원만)
-        obs_dim = proprio_37.size(1)  # 37
-        self.obs_history = torch.cat((self.obs_history[:, obs_dim:], proprio_37), dim=-1)
+        # 37차원만 정규화 (기존 obs_mean, obs_var 사용)
+        diff = proprio_37 - self.obs_mean
+        normed_proprio_37 = diff / torch.sqrt(self.obs_var + 1e-8*torch.ones_like(self.obs_var))
+        
+        # 6) Last actions (12차원) - 정규화 없음
+        last_actions = self.actions[:, :-1] if hasattr(self, 'actions') and self.actions.size(1) > 12 else torch.zeros(self.num_envs, 12, device=self.device)
+        
+        # 7) Height scan (77차원) - 정규화 없음  
+        h_raw = self.get_height_samples()  # (B, 77)
+        
+        # ★ 126차원 observation 구성: 37(정규화됨) + 12 + 77 = 126
+        obs_126 = torch.cat([
+            normed_proprio_37,    # 37차원 (정규화됨)
+            last_actions,         # 12차원 (정규화 안됨)
+            h_raw                 # 77차원 (정규화 안됨)
+        ], dim=-1)
+        
+        # ★ obs_buf에 126차원 전체 할당
+        self.obs_buf[:] = obs_126
+        
+        # History update (37차원 proprio만)
+        obs_dim = normed_proprio_37.size(1)  # 37
+        self.obs_history = torch.cat((self.obs_history[:, obs_dim:], normed_proprio_37), dim=-1)
         
         epi_start_idx = (self.epi_len == 0)
         total_slices = self.num_obs_his * self.num_obs_skip
         for i in range(total_slices):
             start = obs_dim * i
             end   = obs_dim * (i + 1)
-            self.obs_history[epi_start_idx, start:end] = proprio_37[epi_start_idx]
+            self.obs_history[epi_start_idx, start:end] = normed_proprio_37[epi_start_idx]
 
         ################################################################
         # Privileged state: 126 + 6 + 6 + 6 = 144차원
-        foot_pos = self.body_states[:, [self.left_foot_idx, self.right_foot_idx], 0:3].flatten(1)  # 6차원
-        foot_vel = self.body_states[:, [self.left_foot_idx, self.right_foot_idx], 7:10].flatten(1)  # 6차원
+        foot_pos = self.body_states[:, [self.left_foot_idx, self.right_foot_idx], 0:3].flatten(1)
+        foot_vel = self.body_states[:, [self.left_foot_idx, self.right_foot_idx], 7:10].flatten(1)
         
         # Contact forces (6차원)
-        left_foot_contact = self.contact_forces[:, self.left_foot_idx, :3]   # (B,3)
-        right_foot_contact = self.contact_forces[:, self.right_foot_idx, :3] # (B,3)
-        contact_forces = torch.cat([left_foot_contact, right_foot_contact], dim=1)  # (B,6)
+        left_foot_contact = self.contact_forces[:, self.left_foot_idx, :3]
+        right_foot_contact = self.contact_forces[:, self.right_foot_idx, :3]
+        contact_forces = torch.cat([left_foot_contact, right_foot_contact], dim=1)
         
         # Privileged state 구성
         priv_vec = torch.cat([
-            normed_obs_126,     # 126차원 (observation)
-            foot_pos,           # 6차원
-            foot_vel,           # 6차원  
-            contact_forces      # 6차원
-        ], dim=1)              # 총 144차원
+            obs_126,         # 126차원 (observation)
+            foot_pos,        # 6차원
+            foot_vel,        # 6차원  
+            contact_forces   # 6차원
+        ], dim=1)           # 총 144차원
         
         # Dynamic privileged state buffer allocation
         if self.states_buf.shape[1] != priv_vec.shape[1]:
@@ -701,7 +703,6 @@ class DyrosDynamicWalk(VecTask):
             self.cfg["env"]["numStates"] = int(priv_vec.shape[1])
         
         self.states_buf[:] = priv_vec
-        ################################################################
         
 
     def start_perturbation(self, ids):

@@ -12,7 +12,7 @@ env:
   
   clipActions: 1.0
 
-  NumSingleStepObs: 126
+  NumSingleStepObs: 37
   NumAction: 13
   #numStates: 187
   height_emb_dim: 24
